@@ -490,21 +490,42 @@ jobs:
           # 的续行反斜杠与变量赋值都会被缩进破坏。
           sed -i 's/^          //' devices/rubens-ubuntu.conf
 
-          # 自检：去掉缩进后不应再有任何行以空格开头，也不应有 YAML 缩进残留。
-          if grep -qE '^ ' devices/rubens-ubuntu.conf; then
-            echo "::error::profile 仍带缩进，续行会被破坏"; exit 1
-          fi
-          for v in DISTRO SUITE KERNEL_LOCALVERSION DEFAULT_USER \
-                   ROOTFS_LABEL USERDATA_PART NVDATA_PART; do
-            grep -qE "^${v}=" devices/rubens-ubuntu.conf \
-              || { echo "::error::profile 缺 ${v}"; exit 1; }
-          done
+          # 去掉 heredoc 前导空格后，profile 必须能被 bash 直接 source ——
+          # 这是唯一可靠的检查。不能用「不许有行首空格」来判断：
+          # PACKAGES_EXTRA 的续行是**故意缩进**的，正是那个缩进让反斜杠续行成立。
+          bash -c '. devices/rubens-ubuntu.conf' \
+            || { echo "::error::profile 无法被 bash source"; exit 1; }
+
+          # 取值核对：这些变量缺一个，构建就会走错分支或产出会孤儿化模块的镜像
+          bash -c '
+            set -e
+            . devices/rubens-ubuntu.conf
+            for v in DISTRO SUITE KERNEL_CONFIGS DTS KERNEL_MAKE_ARGS \
+                     ROOTFS_LABEL DEFAULT_USER USERDATA_PART NVDATA_PART \
+                     PACKAGES_CORE PACKAGES_EXTRA; do
+              [ -n "${!v}" ] || { echo "::error::$v 为空"; exit 1; }
+            done
+            [ "$DISTRO" = "ubuntu" ] || { echo "::error::DISTRO=$DISTRO"; exit 1; }
+            [ "$SUITE" = "resolute" ] || { echo "::error::SUITE=$SUITE"; exit 1; }
+            [ -z "$KERNEL_LOCALVERSION" ] \
+              || { echo "::error::KERNEL_LOCALVERSION 必须为空，否则 uname -r 带 + 会孤儿化全部模块"; exit 1; }
+            echo "$PACKAGES_EXTRA" | grep -qw wpasupplicant \
+              || { echo "::error::PACKAGES_EXTRA 缺 wpasupplicant（NM 会没有无线能力）"; exit 1; }
+            echo "$PACKAGES_EXTRA" | grep -qw wireless-regdb \
+              || { echo "::error::PACKAGES_EXTRA 缺 wireless-regdb"; exit 1; }
+            echo "profile 变量核对通过；PACKAGES_EXTRA 共 $(echo $PACKAGES_EXTRA | wc -w) 个包"
+          '
 
           # 桌面输入：把 GNOME 最小桌面追加进包列表（镜像会从约 130 MB
           # 涨到约 1.5 GB）。distros/ubuntu.sh 逐个装包，装不上只报告。
           if [ "${{ inputs.build_desktop }}" = "true" ]; then
             sed -i 's/ca-certificates apt-utils"/ca-certificates apt-utils ubuntu-desktop-minimal"/' \
               devices/rubens-ubuntu.conf
+            bash -c '
+              . devices/rubens-ubuntu.conf
+              echo "$PACKAGES_EXTRA" | grep -qw ubuntu-desktop-minimal \
+                || { echo "::error::桌面包未加入"; exit 1; }
+            '
             echo "已加入 ubuntu-desktop-minimal"
           fi
           echo "--- 生成的 profile ---"

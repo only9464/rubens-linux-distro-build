@@ -41,6 +41,7 @@
 | **[docs/SETUP.md](docs/SETUP.md)** | **新建仓库操作指引** —— 建库、触发构建、拿产物、刷机 |
 | **[docs/BUILD.md](docs/BUILD.md)** | **完整构建教程** —— 从零到刷机，含每一步的验证命令 |
 | **[docs/PITFALLS.md](docs/PITFALLS.md)** | **踩坑清单（必读）** —— 13 个坑的症状/根因/修法，含方法论复盘 |
+| **[docs/SOURCES.md](docs/SOURCES.md)** | **每个文件的来源** —— 逐文件说明出处与生成过程，以及怎么重新生成 |
 | [.github/workflows/build.yml](.github/workflows/build.yml) | GitHub Actions 自动构建 |
 
 > **第一次接触这个项目请先读 `PITFALLS.md`。** 那些坑合计消耗 20+ 小时，
@@ -65,7 +66,9 @@ cd ..
 git clone https://github.com/MT6895-Mainline/rootfs.git rootfs-builder
 
 # 3. 配置 + 编译（⚠️ 先 dtbs 再 Image）
-cp configs/kernel.config kernel/.config
+#    .config 一定要放进 out/，不能放源码树根！
+#    放源码树根会让内核 Makefile 判定「source tree is not clean」而中止。
+mkdir -p kernel/out && cp configs/kernel.config kernel/out/.config
 cd kernel
 make -C . O=out ARCH=arm64 LLVM=1 dtbs                    # 步骤 1
 LOCALVERSION= make -C . O=out ARCH=arm64 LLVM=1 -j$(nproc) Image modules   # 步骤 2
@@ -104,7 +107,8 @@ LK 是厂商 bootloader，有**硬性约束**，违反就复位循环：
 │   ├── SETUP.md                      新建仓库操作指引
 │   ├── BUILD.md                      完整构建教程
 │   ├── PITFALLS.md                   踩坑清单（必读）
-│   └── HARDWARE.md                   硬件支持矩阵与已知无害警告
+│   ├── HARDWARE.md                   硬件支持矩阵与已知无害警告
+│   └── SOURCES.md                    每个文件的来源与生成过程
 ├── configs/
 │   ├── kernel.config                 完整 .config（权威、可直接用）
 │   ├── rubens-ubuntu-overlay.config  相对基线的最小差分（便于理解）
@@ -137,7 +141,7 @@ LK 是厂商 bootloader，有**硬性约束**，违反就复位循环：
 | `scripts/make-bootimg.sh` | ⚠️ **端到端逻辑验证，未刷机** | 生成的 boot.img 与实机验证过的镜像**内核逐字节一致、文件大小一致**，`/init` 的功能点计数全部相同（差异仅为注释）。**但这一份尚未在设备上启动过** |
 | `scripts/flash.sh` | ✅ **实测通过** | 只打印命令，不执行 |
 | `scripts/extract-overlay.sh` | ✅ **实测通过** | 生成了 50 项差分 |
-| `.github/workflows/build.yml` | ⚠️ **结构验证，未在 CI 实跑** | YAML 无 tab、20 个 step / 15 个 `run` 块全部通过 `bash -n`，step id 引用有效。内核来源解析逻辑已离线测试全部 6 种输入组合。尚未在真实 runner 上执行过 |
+| `.github/workflows/build.yml` | ⚠️ **结构验证，未在 CI 实跑通过** | 23 个 step / 21 个 `run` 块全部通过 `bash -n`；step id 引用有效；内核来源解析逻辑已离线测试全部 6 种输入组合。**已知失败点**：早期版本在「调整设备配置」步骤因上游 rootfs 仓库没有 `devices/rubens-ubuntu.conf` / `distros/ubuntu.sh` 而失败（现已改为 workflow 现场生成），并补上了 `build.sh` 的 dtbs 顺序补丁。修正后**尚未拿到一次完整的绿色运行** |
 | `docs/HARDWARE.md` 的数据 | ✅ **实机采集** | 全部来自设备上的 `dmesg` / `/sys` |
 
 **首次使用时建议**：
@@ -213,5 +217,7 @@ LK 是厂商 bootloader，有**硬性约束**，违反就复位循环：
 ## 许可与免责
 
 - 内核补丁与构建脚本：跟随上游（GPL-2.0）
-- **厂商固件不包含在本仓库** —— 需你从自己的设备提取
+- **厂商固件（`firmware/`）是专有 blob** —— 随仓库分发只是为了 CI 能构建出
+  可直接刷入的镜像；公开前请自行确认合规性，建议把仓库设为 private。
+  逐个文件的来源见 [docs/SOURCES.md](docs/SOURCES.md#5-firmware)
 - 本教程仅用于**你自己拥有的设备**。刷机有风险，作者不承担任何责任

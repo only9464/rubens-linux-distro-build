@@ -11,12 +11,12 @@
 | 内容 | 大小 | 为什么不放 GitHub 就下不到 |
 |---|---|---|
 | `firmware/` | 3.2 MB | **厂商固件**（WiFi / 蓝牙 / Mali GPU / 触摸屏）。版权原因，任何公开仓库都不会分发 |
-| `ramdisk-proven.lz4` | 730 KB | 在**真机上验证过能启动**的 initramfs。它包含针对本设备修正过的 `/init` |
+| `ramdisk-proven.lz4` | 729 KB | 在**真机上验证过能启动**的 initramfs。它包含针对本设备修正过的 `/init` |
 | `configs/kernel.config` | 321 KB | 实测能通过 LK 体积上限、且 WiFi/蓝牙/GPU/传感器全部工作的内核配置 |
 | `patches/` | 29 KB | 移植补丁（上游基线之上必须的 5 个文件改动） |
-| `scripts/` | 33 KB | 构建脚本 |
-| `docs/` | 80 KB | 文档 |
-| `.github/workflows/build.yml` | 15 KB | 构建流程 |
+| `scripts/` | 34 KB | 构建脚本 |
+| `docs/` | 94 KB | 文档（含 `SOURCES.md` 逐文件来源台账） |
+| `.github/workflows/build.yml` | 47 KB | 构建流程（内嵌设备 profile、Ubuntu 后端与 `build.sh` 补丁） |
 
 **不放**（workflow 运行时从 GitHub 克隆）：
 
@@ -25,6 +25,8 @@
 - 编译产物 —— 每次构建生成，用 Artifact 下载
 
 **仓库总大小约 4.5 MB。** 没有 LFS 需求。
+
+逐个文件的出处与生成过程见 **[SOURCES.md](SOURCES.md)**。
 
 ---
 
