@@ -141,7 +141,7 @@ LK 是厂商 bootloader，有**硬性约束**，违反就复位循环：
 | `scripts/make-bootimg.sh` | ⚠️ **端到端逻辑验证，未刷机** | 生成的 boot.img 与实机验证过的镜像**内核逐字节一致、文件大小一致**，`/init` 的功能点计数全部相同（差异仅为注释）。**但这一份尚未在设备上启动过** |
 | `scripts/flash.sh` | ✅ **实测通过** | 只打印命令，不执行 |
 | `scripts/extract-overlay.sh` | ✅ **实测通过** | 生成了 50 项差分 |
-| `.github/workflows/build.yml` | ⚠️ **结构验证，未在 CI 实跑通过** | 23 个 step / 21 个 `run` 块全部通过 `bash -n`；step id 引用有效；内核来源解析逻辑已离线测试全部 6 种输入组合。**已知失败点**：早期版本在「调整设备配置」步骤因上游 rootfs 仓库没有 `devices/rubens-ubuntu.conf` / `distros/ubuntu.sh` 而失败（现已改为 workflow 现场生成），并补上了 `build.sh` 的 dtbs 顺序补丁。修正后**尚未拿到一次完整的绿色运行** |
+| `.github/workflows/build.yml` | ⚠️ **结构验证 + 生成步骤离线实测，但未在 CI 跑完** | YAML 可被 `yaml.safe_load` 解析；23 个 step / 21 个 `run` 块通过 `bash -n`；内核来源解析逻辑已离线测试全部 6 种输入组合。三个生成类 step（写入 profile / 写入后端 / 修补 build.sh）已**原样抽出执行**：profile 能被 bash source 且 25 个包、`KERNEL_LOCALVERSION` 为空、`wpasupplicant` 在列；`distros/ubuntu.sh` 语法通过；打补丁后的 `build.sh` 与本地已验证版本**逐字节相同**（md5 `669cee45…`，27 行 TAB 保留）。**仍未拿到一次完整的绿色 CI 运行**，剩余风险在 mmdebstrap 的权限与镜像可达性 |
 | `docs/HARDWARE.md` 的数据 | ✅ **实机采集** | 全部来自设备上的 `dmesg` / `/sys` |
 
 **首次使用时建议**：
