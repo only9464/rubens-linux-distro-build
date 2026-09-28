@@ -43,7 +43,7 @@ on:
         type: string
 
       kernel_commit:
-        description: 'commit / tag（留空 = 使用该分支的最新提交）'
+        description: '完整或简写 commit / tag（留空 = 使用该分支的最新提交）'
         required: false
         default: ''
         type: string
@@ -58,7 +58,7 @@ env:
   # 默认内核来源与基线（实测可启动的组合）
   DEFAULT_KERNEL_REPO:   https://github.com/MT6895-Mainline/linux.git
   DEFAULT_KERNEL_BRANCH: port/rubens-clean
-  DEFAULT_KERNEL_COMMIT: 80d38270aa
+  DEFAULT_KERNEL_COMMIT: 80d38270aacdcb17db3cba8cfb522bf248f354f6
 
   ROOTFS_REPO:    https://github.com/MT6895-Mainline/rootfs.git
   KERNEL_RELEASE: "7.2.0"
@@ -70,7 +70,7 @@ env:
 jobs:
   build:
     # 只是宿主；真正的构建环境是下面的容器
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     container:
       image: ubuntu:26.04      # 与本地验证环境一致的工具链
       options: --user root
@@ -191,23 +191,62 @@ jobs:
           BRANCH="${{ steps.src.outputs.branch }}"
           COMMIT="${{ steps.src.outputs.commit }}"
 
+          # 用 blob 过滤克隆：历史完整（能解析任意 SHA），但不下载文件内容，
+          # checkout 时才按需拉取，比全量克隆快很多。
           git clone --filter=blob:none "$REPO" kernel
           cd kernel
+          git config --global --add safe.directory "$PWD"
 
-          if [ -n "$COMMIT" ]; then
-            # 指定了 commit/tag：优先按分支浅取，失败则直接按 ref 取
-            git fetch --depth 1 origin "$COMMIT" 2>/dev/null \
-              || git fetch origin "$COMMIT"
-            git checkout "$COMMIT"
-          else
-            # 未指定：取该分支的最新提交
+          # COMMIT 可能是三种形态，处理方式不同：
+          #   1. 完整 40 位 SHA  -> git fetch 可以直接取（GitHub 支持）
+          #   2. tag 名          -> git fetch 可以取
+          #   3. 短 SHA          -> **远端无法解析**（Git 协议不接受简写），
+          #                         必须先把分支历史取下来再在本地匹配
+          # 之前的写法直接 `git fetch origin 80d38270aa` 就会失败：
+          #   fatal: couldn't find remote ref 80d38270aa
+          TARGET=""
+
+          if [ -z "$COMMIT" ]; then
+            echo "未指定 commit，取分支 $BRANCH 的最新提交"
             git fetch --depth 1 origin "$BRANCH"
             git checkout -b "$BRANCH" FETCH_HEAD
+            TARGET="$BRANCH 最新"
+          else
+            echo "指定了 commit/tag: $COMMIT"
+
+            if [ ${#COMMIT} -eq 40 ] && [[ "$COMMIT" =~ ^[0-9a-fA-F]{40}$ ]]; then
+              echo "  识别为完整 SHA"
+              git fetch --depth 1 origin "$COMMIT"
+              git checkout "$COMMIT"
+            elif git fetch --depth 1 origin "refs/tags/$COMMIT" 2>/dev/null; then
+              echo "  识别为 tag"
+              git checkout "FETCH_HEAD"
+            else
+              echo "  识别为短 SHA 或分支名，拉取 $BRANCH 的历史后在本地匹配"
+              # 先试深层浅取，失败再全量取该分支
+              if ! git fetch --depth 200 origin "$BRANCH" 2>/dev/null; then
+                echo "  浅取失败，改为取该分支的完整历史"
+                git fetch origin "$BRANCH"
+              fi
+              FULL=$(git rev-parse --verify "${COMMIT}^{commit}" 2>/dev/null || true)
+              if [ -z "$FULL" ]; then
+                echo "::error::在 $BRANCH 的历史里找不到 commit '$COMMIT'"
+                echo "提示：若该 commit 不在这个分支上，请把分支名也填上正确的值。"
+                echo "该分支最近 10 个提交："
+                git log --oneline -10 FETCH_HEAD 2>/dev/null | sed 's/^/  /'
+                exit 1
+              fi
+              echo "  解析为完整 SHA: $FULL"
+              git checkout "$FULL"
+            fi
+            TARGET="$COMMIT"
           fi
 
           git checkout -b rubens-ubuntu 2>/dev/null || git checkout -B rubens-ubuntu
-          echo "已检出:"
+          echo
+          echo "已检出（目标: $TARGET）:"
           git log --oneline -1
+          git status --porcelain | head
 
       # ────────────────────────────────────────────── 4. 应用移植补丁
       - name: 应用移植补丁
