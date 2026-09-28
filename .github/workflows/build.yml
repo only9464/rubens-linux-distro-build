@@ -319,11 +319,41 @@ jobs:
             fi
           done
 
+      # ────────────────────────────────────────────── 5c. 写入内核配置
+      #
+      # 配置文件必须放到【输出目录】的 .config，不能放源码树根的 .config。
+      # 内核的 outputmakefile 规则（Makefile:709）会检查三个条件，任一为真就
+      # 判定源码树不干净并拒绝构建：
+      #
+      #   [ -f $(srctree)/.config -o \
+      #     -d $(srctree)/include/config -o \
+      #     -d $(srctree)/arch/$(SRCARCH)/include/generated ]
+      #
+      # 而 `O=out` 模式下，$(srctree) 指的是源码树根 —— 所以把 .config 放在那里
+      # 正好触发第一个条件。正确的位置是 out/.config。
+      #
+      # 之前踩过的两次坑，都是为了绕开这个自己造成的错误：
+      #   1. 以为 --filter=blob:none 能解决（它只影响下载，不影响检出）
+      #   2. 加 mrproper + git clean（对源码树根那个 .config 完全无用，
+      #      因为它是我们自己刚 cp 进去的）
       - name: 写入内核配置
         run: |
           set -euxo pipefail
-          cp configs/kernel.config kernel/.config
           cd kernel
+
+          # 输出目录必须先存在，否则 make 会把 O=out 当成别的东西
+          mkdir -p out
+          cp ../configs/kernel.config out/.config
+
+          # 复位检查：这三个路径任何一个存在都会让 make 拒绝构建
+          for p in .config include/config arch/arm64/include/generated; do
+            if [ -e "$p" ]; then
+              echo "::error::源码树里的 $p 会让 make 报 'source tree is not clean'"
+              exit 1
+            fi
+          done
+          echo "源码树干净，配置已放到 out/.config"
+
           make ARCH=arm64 LLVM=1 O=out olddefconfig
 
           echo "抽查关键配置项："
