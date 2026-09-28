@@ -561,6 +561,32 @@ find "$CACHE" -name '*.ko' | wc -l           # 必须是 1608
 > `$OUT/.work-*/kernel` 抢救——那是它的真实工作树，`Makefile` 是完整内核
 > Makefile，形状正确。但那样头一次仍要等一整个内核编译。
 
+### 4.1b CI 上的跨 run 复用（省下那 77 分钟）
+
+`build.yml` 用 `actions/cache` 把内核编译结果按指纹存起来，
+**下一次运行直接命中、跳过编译**：
+
+```
+key = kernel-${CACHE_VERSION}-${commit}-${hashFiles(内核配置, fixups, 补丁)}
+```
+
+这让"新开一次 action 只为了跑失败的后半段"变成只等 rootfs 那十几分钟，
+而不是再等一个多小时。
+
+几个设计要点（都是实测或踩过的坑）：
+
+| 决定 | 原因 |
+|---|---|
+| 缓存 `kernel/` 整棵树 | `build.sh` 需要 `$KBOUT` 形状的树，in-tree 构建树天然就是 |
+| 存前删掉 `.o` | 实测 `modules_install` **一个 `.o` 都不需要**（只读 `modules.order` 与 `.ko`）；删掉后 9.9 GB → 4.6 GB，压缩后约 1 GB |
+| **必须保留 `.git`** | `build.sh` 缓存命中时会跑 `git -C "$KERNEL_REPO" archive` 铺源码；没有 `.git` 会 `fatal: 不是 Git 仓库` |
+| **不设 `restore-keys`** | 前缀回退会命中"别的 commit / 别的配置"编出的内核。内核与 `/lib/modules` 必须严格配对，用错会静默产出模块全部失配的镜像。宁可重编 |
+| 命中时跳过 6 个 step | 其中 `清理内核源码树` 最危险：它的 `git clean -xdf` 会把缓存里的构建产物全删掉 |
+| `force_kernel_rebuild` 输入 | 想强制重编时的开关；同时 `CACHE_VERSION` 改一处即可整体作废旧缓存 |
+
+> 改动内核配置 / 补丁 / 构建方式后，**把 `env.CACHE_VERSION` 加一**。
+> 虽然 key 里已经含配置与补丁的哈希，改版本号是更直观的"全部作废"手段。
+
 ### 4.2 设备 profile 与发行版后端（**这两个文件上游没有**）
 
 上游 `MT6895-Mainline/rootfs` 里：

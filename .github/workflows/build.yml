@@ -54,6 +54,12 @@ on:
         default: false
         type: boolean
 
+      force_kernel_rebuild:
+        description: '忽略内核缓存，强制重编内核（改了补丁/配置却想复用旧 workflow 时用）'
+        required: false
+        default: false
+        type: boolean
+
 env:
   # 默认内核来源与基线（实测可启动的组合）
   DEFAULT_KERNEL_REPO:   https://github.com/MT6895-Mainline/linux.git
@@ -66,6 +72,10 @@ env:
   # LK 是厂商 bootloader，有硬性体积上限：
   #   0x3640000 实测能启动；0x3820000 会复位循环。超过就别刷。
   IMAGE_SIZE_BUDGET: "0x3640000"
+
+  # 内核缓存的版本号。**改了内核配置、补丁或构建方式就把它 +1**，
+  # 否则会命中旧的、与新配置不匹配的缓存。
+  CACHE_VERSION: v1
 
 jobs:
   build:
@@ -185,6 +195,7 @@ jobs:
 
       # ────────────────────────────────────────────── 3. 克隆内核
       - name: 克隆内核源码
+        if: env.SKIP_KERNEL_BUILD != '1'
         run: |
           set -euxo pipefail
           REPO="${{ steps.src.outputs.repo }}"
@@ -248,8 +259,57 @@ jobs:
           git log --oneline -1
           git status --porcelain | head
 
-      # ────────────────────────────────────────────── 4. 应用移植补丁
+      # ────────────────────────────────────────────── 4. 恢复内核缓存（跨 run 复用）
+      #
+      # 实测这台 runner 编一次内核要 **77 分钟**。如果每次重试都从头编，
+      # 那"后面的步骤失败"就要再等一个多小时。这里把编译结果按
+      # 内核来源 + 配置 + 补丁的指纹缓存起来，下一次直接命中、跳过编译。
+      #
+      # 缓存只存**构建产物**（4.6 GB，压缩后约 1 GB），不存源码：
+      # build.sh 本来就会用 `git archive` 把源码铺回去，所以源码不必进缓存。
+      #
+      # 命中后 build_image/dtbs/modules 三步整体跳过；build.sh 那边仍会把
+      # 这棵树当成它的内核缓存（见「把编译结果做成 build.sh 的内核缓存」）。
+      #
+      # 刻意**不设 restore-keys**：前缀回退会命中"别的 commit / 别的配置"编出来的
+      # 内核，而内核与 /lib/modules 必须严格配对，用错会静默产出模块全部失配的
+      # 镜像。宁可缓存不命中、重编一次，也不要拿错的内核。
+      - name: 恢复内核缓存
+        id: kcache
+        uses: actions/cache/restore@v4
+        with:
+          path: kernel
+          key: >-
+            kernel-${{ env.CACHE_VERSION }}-${{
+              inputs.force_kernel_rebuild == true && 'nocache' ||
+              format('{0}-{1}', steps.src.outputs.commit, hashFiles('configs/kernel.config', 'configs/mt6895-fixups.config', 'patches/0001-rubens-port-fixes.patch'))
+            }}
+
+      - name: 判断是否真的要编内核
+        run: |
+          HIT="${{ steps.kcache.outputs.cache-hit }}"
+          if [ "${{ inputs.force_kernel_rebuild }}" = "true" ]; then
+            HIT="false"
+            echo "指定了 force_kernel_rebuild，忽略缓存"
+          fi
+          if [ "$HIT" = "true" ] && [ -f kernel/arch/arm64/boot/Image ] \
+             && [ -f kernel/Module.symvers ] && [ -f kernel/.config ]; then
+            echo "SKIP_KERNEL_BUILD=1" >> "$GITHUB_ENV"
+            echo "✅ 内核缓存命中 —— 跳过编译（省下约 77 分钟）"
+            echo "   Image : $(stat -c %s kernel/arch/arm64/boot/Image) 字节"
+            echo "   模块  : $(find kernel -name '*.ko' | wc -l) 个"
+            echo "   版本  : $(cat kernel/include/config/kernel.release 2>/dev/null || echo 未知)"
+          else
+            echo "SKIP_KERNEL_BUILD=0" >> "$GITHUB_ENV"
+            if [ "$HIT" = "true" ]; then
+              echo "::warning::缓存标记命中但内容不完整，改为重新编译"
+            else
+              echo "未命中内核缓存 —— 本次会完整编译（约 77 分钟）"
+            fi
+          fi
+
       - name: 应用移植补丁
+        if: env.SKIP_KERNEL_BUILD != '1'
         id: patch
         run: |
           set -euxo pipefail
@@ -267,7 +327,7 @@ jobs:
           }
           git log --oneline -2
 
-      # ────────────────────────────────────────────── 4b. 补丁失败时的指引
+      # ────────────────────────────────────────────── 5b. 补丁失败时的指引
       # 换用别的内核 commit 时，补丁可能对不上。这里把冲突细节打出来，
       # 方便判断是需要改补丁，还是换个基线。
       - name: 补丁冲突排查
@@ -283,8 +343,8 @@ jobs:
           echo "提示：若换了内核基线，patches/0001-rubens-port-fixes.patch"
           echo "      可能需要重新生成（见 docs/BUILD.md §3.1）。"
 
-      # ────────────────────────────────────────────── 5. 配置内核
-      # ────────────────────────────────────────────── 5b. 清理源码树
+      # ────────────────────────────────────────────── 6. 配置内核
+      # ────────────────────────────────────────────── 6b. 清理源码树
       # 上游 MT6895-Mainline/linux 把内核构建产物也提交进了仓库
       # （include/config、include/generated 等）。而 make 的 outputmakefile 规则
       # 会据此判定"源码树不干净"，直接拒绝在 O=out 里构建：
@@ -301,6 +361,7 @@ jobs:
       #
       # 顺序很重要：mrproper 会把 .config 一起删掉，所以必须在写配置之前跑。
       - name: 清理内核源码树
+        if: env.SKIP_KERNEL_BUILD != '1'
         run: |
           set -euxo pipefail
           cd kernel
@@ -319,7 +380,7 @@ jobs:
             fi
           done
 
-      # ────────────────────────────────────────────── 5c. 写入内核配置
+      # ────────────────────────────────────────────── 6c. 写入内核配置
       #
       # 配置文件必须放到【输出目录】的 .config，不能放源码树根的 .config。
       # 内核的 outputmakefile 规则（Makefile:709）会检查三个条件，任一为真就
@@ -337,6 +398,7 @@ jobs:
       #   2. 加 mrproper + git clean（对源码树根那个 .config 完全无用，
       #      因为它是我们自己刚 cp 进去的）
       - name: 写入内核配置
+        if: env.SKIP_KERNEL_BUILD != '1'
         run: |
           set -euxo pipefail
           cd kernel
@@ -368,11 +430,12 @@ jobs:
             echo "确认：in-tree 构建树"
           fi
 
-      # ────────────────────────────────────────────── 6. 编译内核
+      # ────────────────────────────────────────────── 7. 编译内核
       # 必须先单独编 dtbs：arch/arm64/kernel/Makefile 里的 DTB 规则标了 FORCE，
       # 而它调用子 make 时漏传 O=$(objtree)，会跑回源码树找 .config 而失败。
       # 先编 dtbs 把文件落到盘上，该规则随后成为 no-op。
       - name: 编译设备树
+        if: env.SKIP_KERNEL_BUILD != '1'
         run: |
           set -euxo pipefail
           cd kernel
@@ -380,6 +443,7 @@ jobs:
           test -f arch/arm64/boot/dts/mediatek/mt6895-xiaomi-rubens.dtb
 
       - name: 编译内核与模块
+        if: env.SKIP_KERNEL_BUILD != '1'
         run: |
           set -euxo pipefail
           cd kernel
@@ -389,11 +453,11 @@ jobs:
           LOCALVERSION= make -C . ARCH=arm64 LLVM=1 \
             -j"$(nproc)" Image modules 2>&1 | tail -30
 
-      # ────────────────────────────────────────────── 7. 门禁校验
+      # ────────────────────────────────────────────── 8. 门禁校验
       - name: 校验内核（体积 / 版本 / 配置 / DTB）
         run: ./scripts/verify-kernel.sh kernel
 
-      # ────────────────────────────────────────────── 8. 构建系统镜像
+      # ────────────────────────────────────────────── 9. 构建系统镜像
       - name: 克隆 rootfs 构建器
         run: git clone --depth 1 "$ROOTFS_REPO" rootfs-builder
 
@@ -460,6 +524,24 @@ jobs:
           echo "模块         : $(find "$CACHE" -name '*.ko' | wc -l) 个"
           echo "大小         : $(du -sh "$CACHE" | cut -f1)"
           echo "REL=$REL" >> "$GITHUB_ENV"
+
+      - name: 精简内核树（删 .o，为缓存瘦身）
+        if: env.SKIP_KERNEL_BUILD != '1'
+        run: |
+          set -euxo pipefail
+          BEFORE=$(du -sm kernel | cut -f1)
+          find kernel -name '*.o' -delete
+          find kernel -name '.*.o.cmd' -delete
+          AFTER=$(du -sm kernel | cut -f1)
+          echo "删掉 .o：${BEFORE} MB -> ${AFTER} MB"
+          # 自检：缓存内容一个都不能少
+          for f in arch/arm64/boot/Image .config Module.symvers \
+                   include/config/kernel.release modules.order .git; do
+            [ -e "kernel/$f" ] || { echo "::error::缓存内容缺 $f"; exit 1; }
+          done
+          N=$(find kernel -name '*.ko' | wc -l)
+          [ "$N" -gt 1500 ] || { echo "::error::模块数异常: $N"; exit 1; }
+          echo "缓存内容自检通过（$N 个 .ko）"
 
       # 上游 MT6895-Mainline/rootfs 的 devices/ 里只有
       #   pearl.conf  qqcandy.conf  rubens.conf  xaga.conf
@@ -967,7 +1049,7 @@ jobs:
           done
           echo "rootfs 校验通过"
 
-      # ────────────────────────────────────────────── 9. 打包启动镜像
+      # ────────────────────────────────────────────── 10. 打包启动镜像
       - name: 打包 boot.img
         run: |
           set -euxo pipefail
@@ -978,7 +1060,7 @@ jobs:
             --firmware firmware \
             --out     boot-ubuntu.img
 
-      # ────────────────────────────────────────────── 10. 产物
+      # ────────────────────────────────────────────── 11. 产物
       - name: 生成校验和
         run: |
           set -euxo pipefail
@@ -1008,6 +1090,31 @@ jobs:
             rootfs-builder/out/KERNEL-INFO-rubens-ubuntu.txt
             SHA256SUMS
           retention-days: 30
+
+      # ────────────────────────────────────────────── 12. 精简内核树（为缓存瘦身）
+      # 为下一步的缓存瘦身：实测 modules_install **一个 .o 都不需要**
+      # （它只读 modules.order 与 .ko）。删掉后树从 9.9 GB 降到 4.6 GB。
+      # .git 必须保留 —— build.sh 要在 KERNEL_REPO 里跑 git archive 铺源码。
+
+      # ────────────────────────────────────────────── 12b. 保存内核缓存（跨 run 复用）
+      #
+      # 「在新开的一次 action 里直接跳过内核编译」靠这一步。缓存键含内核来源、
+      # 内核配置与补丁的指纹，所以它们一变就会自动重建，不会用错缓存。
+      #
+      # 放在流程最末尾：只有前面的构建都成功了才值得把产物存起来。
+      # 上面「精简内核树」已删掉 .o（modules_install 不需要它们），
+      # 树从 9.9 GB 降到 4.6 GB，压缩后约 1 GB。.git 必须保留，
+      # 因为 build.sh 要在 KERNEL_REPO 里跑 git archive 铺源码。
+      - name: 保存内核缓存
+        if: env.SKIP_KERNEL_BUILD != '1'
+        uses: actions/cache/save@v4
+        with:
+          path: kernel
+          key: >-
+            kernel-${{ env.CACHE_VERSION }}-${{
+              format('{0}-{1}', steps.src.outputs.commit, hashFiles('configs/kernel.config', 'configs/mt6895-fixups.config', 'patches/0001-rubens-port-fixes.patch'))
+            }}
+
 
       - name: 写入构建摘要
         if: always()

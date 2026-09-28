@@ -141,7 +141,7 @@ LK 是厂商 bootloader，有**硬性约束**，违反就复位循环：
 | `scripts/make-bootimg.sh` | ⚠️ **端到端逻辑验证，未刷机** | 生成的 boot.img 与实机验证过的镜像**内核逐字节一致、文件大小一致**，`/init` 的功能点计数全部相同（差异仅为注释）。**但这一份尚未在设备上启动过** |
 | `scripts/flash.sh` | ✅ **实测通过** | 只打印命令，不执行 |
 | `scripts/extract-overlay.sh` | ✅ **实测通过** | 生成了 50 项差分 |
-| `.github/workflows/build.yml` | ⚠️ **前半段已在 CI 实测通过；后半段未跑** | **已实测通过**：克隆内核 → 应用补丁 → 清理 → 写配置 → 编 dtbs → 编内核与模块 → 门禁校验（run 7 的全部 16 步 ✅，内核能在 CI 里编出来）。三个生成类 step（写入 profile / 写入后端 / 修补 build.sh）已原样抽出执行：打补丁后的 `build.sh` 与本地已验证版本**逐字节相同**（md5 `669cee45…`）。**未验证**：rootfs 构建（mmdebstrap 在容器里的 mount 权限、清华镜像可达性）与 boot.img 打包 |
+| `.github/workflows/build.yml` | ⚠️ **内核段已在 CI 实测通过；rootfs 段未跑** | **已实测通过**：克隆内核 → 应用补丁 → 清理 → 写配置 → 编 dtbs → 编内核与模块 → 门禁校验（run 7 的全部 16 步 ✅）。三个生成类 step 抽出执行后，打补丁的 `build.sh` 与本地已验证版本**逐字节相同**（md5 `669cee45…`）。内核缓存方案已离线验证：精简到 4.6 GB 后 `make modules_install` 仍能装全 1608 个模块。**未验证**：rootfs 构建（mmdebstrap 的 mount 权限、清华镜像可达性）与 boot.img 打包 |
 | `docs/HARDWARE.md` 的数据 | ✅ **实机采集** | 全部来自设备上的 `dmesg` / `/sys` |
 
 **首次使用时建议**：
@@ -170,6 +170,12 @@ LK 是厂商 bootloader，有**硬性约束**，违反就复位循环：
 | 分支名 | 填了地址则**自动探测主分支**；否则用 `port/rubens-clean` |
 | commit / tag | 用该分支**最新提交**（三个都留空才用已验证的 `80d38270aa`） |
 | 打进 GNOME 桌面 | 否（镜像约 130 MB；勾选后约 1.5 GB） |
+| 强制重编内核 | 否（默认复用 `actions/cache` 里的内核编译结果） |
+
+**内核编译结果会跨运行缓存**（约 1 GB，键含内核 commit + 配置 + 补丁的指纹）。
+实测 runner 编一次内核要 **77 分钟**，所以后半段步骤失败后重跑时，
+这一次的编译会被直接跳过——只等 rootfs 的十几分钟。
+详见 [docs/BUILD.md §4.1b](docs/BUILD.md)。
 
 仓库里**只放从 GitHub 下载不到的文件**（固件、ramdisk 基线、配置、补丁），
 内核源码和 rootfs 构建器都在运行时克隆。**总大小约 4.5 MB。**
