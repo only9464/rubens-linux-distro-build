@@ -1,0 +1,412 @@
+name: 构建 rubens Ubuntu 26.04
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 这个仓库里**只放从 GitHub 下载不到的文件**：
+#
+#   firmware/           厂商固件（WiFi / 蓝牙 / Mali / 触摸屏），版权原因无法从网上获取
+#   ramdisk-proven.lz4  在真机上验证过能启动的 initramfs 基线
+#   configs/            内核配置（实测可启动）
+#   patches/            移植补丁
+#   scripts/            构建脚本
+#
+# 内核源码与 rootfs 构建器都在运行时从 GitHub 克隆，不需要放进仓库。
+#
+# 手动触发时可以指定内核来源（仓库地址 / 分支 / commit），见下面 inputs。
+#
+# ── 为什么跑在 ubuntu:26.04 容器里而不是 runner 直接跑 ──
+#
+# GitHub 托管 runner 目前只有 ubuntu-24.04，它自带的工具链与本移植的验证环境
+# 不符，而且是**硬阻塞**而非"可能有问题"：
+#
+#   clang        24.04 最高 18.1.3，本移植需要 21（18 编不过内核）
+#   lz4          24.04 是 1.9.4，它在 legacy 模式下产出的流内核解压不了 ——
+#                会导致 boot.img 直接启动失败（见 docs/PITFALLS.md §10）
+#   mmdebstrap   24.04 是 1.4.3，构建 26.04 rootfs 的可靠性未知
+#
+# ubuntu:26.04 容器里 apt 直接给出 clang 21 / lz4 1.10 / mmdebstrap 1.5，
+# 与本地验证环境完全一致，且跑在 GitHub 自己的 runner 上，不花钱。
+# ─────────────────────────────────────────────────────────────────────────────
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_repo:
+        description: '内核仓库地址（留空 = 使用默认 MT6895-Mainline/linux）'
+        required: false
+        default: ''
+        type: string
+
+      kernel_branch:
+        description: '分支名（留空：若填了地址则用该仓库的主分支；什么都没填则用 port/rubens-clean）'
+        required: false
+        default: ''
+        type: string
+
+      kernel_commit:
+        description: 'commit / tag（留空 = 使用该分支的最新提交）'
+        required: false
+        default: ''
+        type: string
+
+      build_desktop:
+        description: '把 GNOME 桌面打进系统镜像（镜像会从约 130 MB 涨到约 1.5 GB）'
+        required: false
+        default: false
+        type: boolean
+
+env:
+  # 默认内核来源与基线（实测可启动的组合）
+  DEFAULT_KERNEL_REPO:   https://github.com/MT6895-Mainline/linux.git
+  DEFAULT_KERNEL_BRANCH: port/rubens-clean
+  DEFAULT_KERNEL_COMMIT: 80d38270aa
+
+  ROOTFS_REPO:    https://github.com/MT6895-Mainline/rootfs.git
+  KERNEL_RELEASE: "7.2.0"
+
+  # LK 是厂商 bootloader，有硬性体积上限：
+  #   0x3640000 实测能启动；0x3820000 会复位循环。超过就别刷。
+  IMAGE_SIZE_BUDGET: "0x3640000"
+
+jobs:
+  build:
+    # 只是宿主；真正的构建环境是下面的容器
+    runs-on: ubuntu-24.04
+    container:
+      image: ubuntu:26.04      # 与本地验证环境一致的工具链
+      options: --user root
+    timeout-minutes: 180
+
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      # ────────────────────────────────────────────── 1. 安装工具链
+      - name: 安装编译工具链
+        run: |
+          set -euxo pipefail
+          apt-get update
+          apt-get install -y --no-install-recommends sudo \
+            clang lld llvm \
+            make bc bison flex libssl-dev libelf-dev \
+            device-tree-compiler \
+            cpio gzip xz-utils zstd lz4 \
+            python3 python3-pip \
+            git rsync curl wget ca-certificates \
+            mmdebstrap qemu-user-binfmt \
+            android-sdk-libsparse-utils \
+            mkbootimg
+
+      - name: 检查工具链版本
+        run: |
+          set -euxo pipefail
+          . /etc/os-release
+          echo "构建环境: $PRETTY_NAME"
+          clang --version | head -1
+          ld.lld --version | head -1
+          echo "mmdebstrap: $(mmdebstrap --version)"
+          echo "lz4: $(/usr/bin/lz4 --version 2>&1 | head -1)"
+          echo "make: $(make --version | head -1)"
+
+          CLANG=$(clang --version | grep -oP 'version \K[0-9]+' | head -1)
+          LZ4V=$(/usr/bin/lz4 --version 2>&1 | grep -oP 'v\K[0-9.]+')
+          MMDB=$(mmdebstrap --version | awk '{print $2}')
+
+          fail=0
+          # clang：本移植用 21.1.8 验证；20 以上应可用，低于 20 编不过
+          [ "$CLANG" -ge 20 ] || { echo "::error::clang $CLANG 太旧（需要 20+）"; fail=1; }
+          # lz4：1.9.x 在 legacy 模式下产出的流内核解压不了
+          case "$LZ4V" in
+            1.9.*) echo "::error::lz4 $LZ4V 会在 legacy 模式下产出内核不认的流"; fail=1 ;;
+          esac
+          # mmdebstrap：构建 Ubuntu 26.04 rootfs 建议 1.5+
+          case "$MMDB" in
+            1.[0-4].*|1.[0-4]) echo "::warning::mmdebstrap $MMDB 偏旧，构建可能失败" ;;
+          esac
+          [ "$fail" = 0 ] || exit 1
+          echo "✅ 工具链满足要求"
+
+          # 打包 boot.img 需要的两个工具
+          #
+          # 注意：mkbootimg 在 Ubuntu 26.04 里是 universe 的正式包
+          # （source: android-platform-tools），直接用 apt 装即可。
+          # 不要用 pip —— 26.04 是 PEP 668 的 externally-managed 环境，
+          # pip 会拒绝安装（除非加 --break-system-packages）。
+          for t in mkbootimg simg2img; do
+            printf '  %-12s %s\n' "$t" "$(command -v $t || echo '❌ 缺失')"
+            command -v "$t" >/dev/null 2>&1 || { echo "::error::$t 不可用"; fail=1; }
+          done
+          mkbootimg --help >/dev/null 2>&1 && echo "  mkbootimg 可正常执行"
+          [ "$fail" = 0 ] || exit 1
+
+      # ────────────────────────────────────────────── 2. 解析内核来源
+      # 优先级规则（对应 workflow_dispatch 的三个输入框）：
+      #   地址留空            -> 用默认仓库
+      #   填了地址、分支留空   -> 用该仓库的主分支
+      #   填了分支、commit 留空 -> 用该分支的最新提交
+      #   三个都留空          -> 默认仓库 + 默认分支 + 默认 commit
+      - name: 解析内核来源参数
+        id: src
+        run: |
+          set -euxo pipefail
+
+          REPO="${{ inputs.kernel_repo }}"
+          BRANCH="${{ inputs.kernel_branch }}"
+          COMMIT="${{ inputs.kernel_commit }}"
+
+          if [ -z "$REPO" ]; then
+            # 地址留空：完全使用默认组合
+            REPO="$DEFAULT_KERNEL_REPO"
+            BRANCH="${BRANCH:-$DEFAULT_KERNEL_BRANCH}"
+            # 只有分支也是默认值时才沿用被验证过的 commit
+            if [ "$BRANCH" = "$DEFAULT_KERNEL_BRANCH" ] && [ -z "$COMMIT" ]; then
+              COMMIT="$DEFAULT_KERNEL_COMMIT"
+            fi
+          else
+            # 填了地址
+            if [ -z "$BRANCH" ]; then
+              # 分支留空 -> 探测该仓库的主分支
+              echo "未指定分支，探测 $REPO 的主分支..."
+              BRANCH=$(git ls-remote --symref "$REPO" HEAD 2>/dev/null \
+                       | awk '/^ref:/ {sub("refs/heads/","",$2); print $2; exit}')
+              [ -n "$BRANCH" ] || BRANCH="master"
+              echo "探测到主分支: $BRANCH"
+            fi
+          fi
+
+          echo "内核仓库: $REPO"
+          echo "分支    : $BRANCH"
+          echo "commit  : ${COMMIT:-<最新>}"
+
+          {
+            echo "repo=$REPO"
+            echo "branch=$BRANCH"
+            echo "commit=$COMMIT"
+          } >> "$GITHUB_OUTPUT"
+
+      # ────────────────────────────────────────────── 3. 克隆内核
+      - name: 克隆内核源码
+        run: |
+          set -euxo pipefail
+          REPO="${{ steps.src.outputs.repo }}"
+          BRANCH="${{ steps.src.outputs.branch }}"
+          COMMIT="${{ steps.src.outputs.commit }}"
+
+          git clone --filter=blob:none "$REPO" kernel
+          cd kernel
+
+          if [ -n "$COMMIT" ]; then
+            # 指定了 commit/tag：优先按分支浅取，失败则直接按 ref 取
+            git fetch --depth 1 origin "$COMMIT" 2>/dev/null \
+              || git fetch origin "$COMMIT"
+            git checkout "$COMMIT"
+          else
+            # 未指定：取该分支的最新提交
+            git fetch --depth 1 origin "$BRANCH"
+            git checkout -b "$BRANCH" FETCH_HEAD
+          fi
+
+          git checkout -b rubens-ubuntu 2>/dev/null || git checkout -B rubens-ubuntu
+          echo "已检出:"
+          git log --oneline -1
+
+      # ────────────────────────────────────────────── 4. 应用移植补丁
+      - name: 应用移植补丁
+        id: patch
+        run: |
+          set -euxo pipefail
+          cd kernel
+          git config --global --add safe.directory "$PWD"
+          git config --global user.name ci
+          git config --global user.email ci@localhost
+          git am --3way ../patches/0001-rubens-port-fixes.patch
+          # 工作区必须干净：否则 setlocalversion 会给内核版本追加 '+'，
+          # 导致 uname -r 变成 7.2.0+ 而 /lib/modules/7.2.0 里的模块全部失配
+          git status --porcelain
+          test -z "$(git status --porcelain)" || {
+            echo "::error::工作区不干净，内核版本号会带 + 后缀"
+            exit 1
+          }
+          git log --oneline -2
+
+      # ────────────────────────────────────────────── 4b. 补丁失败时的指引
+      # 换用别的内核 commit 时，补丁可能对不上。这里把冲突细节打出来，
+      # 方便判断是需要改补丁，还是换个基线。
+      - name: 补丁冲突排查
+        if: failure() && steps.patch.outcome == 'failure'
+        run: |
+          cd kernel || exit 0
+          echo "::group::无法应用的 hunk"
+          git am --show-current-patch=diff 2>/dev/null | head -80 || true
+          echo "::endgroup::"
+          echo "::group::冲突文件"
+          git status --short 2>/dev/null || true
+          echo "::endgroup::"
+          echo "提示：若换了内核基线，patches/0001-rubens-port-fixes.patch"
+          echo "      可能需要重新生成（见 docs/BUILD.md §3.1）。"
+
+      # ────────────────────────────────────────────── 5. 配置内核
+      - name: 写入内核配置
+        run: |
+          set -euxo pipefail
+          cp configs/kernel.config kernel/.config
+          cd kernel
+          make ARCH=arm64 LLVM=1 O=out olddefconfig
+
+          echo "抽查关键配置项："
+          grep -E '^CONFIG_XIAOMI_RUBENS=y'            out/.config
+          grep -E '^CONFIG_MTK_COMBO=y'                out/.config
+          grep -E '^CONFIG_MTK_BTIF=y'                 out/.config
+          grep -E '^CONFIG_MTK_TINYSYS_SCP_SUPPORT=y'  out/.config
+          grep -E '^CONFIG_PSTORE_BLK=y'               out/.config
+          grep -E '^CONFIG_DRM_PANTHOR=y'              out/.config
+          grep -qE '^# CONFIG_KALLSYMS_ALL is not set' out/.config
+
+      # ────────────────────────────────────────────── 6. 编译内核
+      # 必须先单独编 dtbs：arch/arm64/kernel/Makefile 里的 DTB 规则会递归
+      # 调用子 make，并行构建时可能抢在 .config 就绪前运行而失败。
+      - name: 编译设备树
+        run: |
+          set -euxo pipefail
+          cd kernel
+          make -C . O=out ARCH=arm64 LLVM=1 dtbs
+          test -f out/arch/arm64/boot/dts/mediatek/mt6895-xiaomi-rubens.dtb
+
+      - name: 编译内核与模块
+        run: |
+          set -euxo pipefail
+          cd kernel
+          # LOCALVERSION= 显式设为空串，阻止 setlocalversion 追加 '+'
+          LOCALVERSION= make -C . O=out ARCH=arm64 LLVM=1 \
+            -j"$(nproc)" Image modules 2>&1 | tail -30
+
+      # ────────────────────────────────────────────── 7. 门禁校验
+      - name: 校验内核（体积 / 版本 / 配置 / DTB）
+        run: ./scripts/verify-kernel.sh kernel/out
+
+      # ────────────────────────────────────────────── 8. 构建系统镜像
+      - name: 克隆 rootfs 构建器
+        run: git clone --depth 1 "$ROOTFS_REPO" rootfs-builder
+
+      - name: 放置内核缓存
+        run: |
+          set -euxo pipefail
+          cd rootfs-builder
+          mkdir -p out
+          rm -rf out/kernel-cache
+          cp -a ../kernel/out out/kernel-cache
+          # 缓存命中的三个必备文件
+          for f in arch/arm64/boot/Image .config Module.symvers \
+                   include/config/kernel.release; do
+            test -f "out/kernel-cache/$f" || { echo "::error::缓存缺 $f"; exit 1; }
+          done
+          REL=$(cat out/kernel-cache/include/config/kernel.release)
+          echo "缓存内核版本: $REL"
+          echo "REL=$REL" >> "$GITHUB_ENV"
+
+      - name: 调整设备配置
+        run: |
+          set -euxo pipefail
+          cd rootfs-builder
+          # 确保 wpasupplicant 在包列表里 —— 缺了它 NetworkManager
+          # 完全没有无线能力，wlan0 永远是 unavailable
+          if ! grep -q 'wpasupplicant' devices/rubens-ubuntu.conf; then
+            sed -i 's/wireless-regdb \\/wireless-regdb wpasupplicant \\/' \
+              devices/rubens-ubuntu.conf
+          fi
+          if [ "${{ inputs.build_desktop }}" = "true" ]; then
+            # 把 GNOME 桌面打进镜像
+            if ! grep -q 'ubuntu-desktop-minimal' devices/rubens-ubuntu.conf; then
+              sed -i 's/curl wget htop tmux ca-certificates apt-utils/curl wget htop tmux ca-certificates apt-utils ubuntu-desktop-minimal/' \
+                devices/rubens-ubuntu.conf
+            fi
+          fi
+          grep -A6 'PACKAGES_EXTRA' devices/rubens-ubuntu.conf
+
+      - name: 构建 rootfs（约 10 分钟）
+        run: |
+          set -euxo pipefail
+          cd rootfs-builder
+          sudo ./build.sh \
+            --device        rubens-ubuntu \
+            --distro        ubuntu \
+            --suite         resolute \
+            --kernel-repo   "$PWD/../kernel" \
+            --kernel-config "$PWD/../kernel/out/.config" \
+            --firmware      "$PWD/../firmware" \
+            --jobs          "$(nproc)" \
+            --hostname      rubens \
+            --root-password root
+
+      - name: 校验 rootfs
+        run: |
+          set -euxo pipefail
+          cd rootfs-builder
+          IMG=$(ls -t out/rootfs-rubens-ubuntu-*-sparse.img | head -1)
+          echo "镜像: $IMG ($(stat -c %s "$IMG") 字节)"
+          echo "IMG=$IMG" >> "$GITHUB_ENV"
+          simg2img "$IMG" /tmp/rootfs.raw
+
+          LABEL=$(dd if=/tmp/rootfs.raw bs=1 skip=$((1024+120)) count=16 2>/dev/null | tr -d '\0')
+          [ "$LABEL" = "mt6895rubens" ] || { echo "::error::卷标是 '$LABEL'，应为 mt6895rubens"; exit 1; }
+          echo "卷标: $LABEL"
+
+          rm -rf /tmp/mods && mkdir -p /tmp/mods
+          debugfs -R "rdump /lib/modules/$REL/kernel /tmp/mods" /tmp/rootfs.raw >/dev/null 2>&1
+          N=$(find /tmp/mods -name '*.ko' | wc -l)
+          echo "模块数: $N"
+          [ "$N" -gt 1000 ] || { echo "::error::模块数异常 ($N)"; exit 1; }
+
+          for p in /sbin/init /lib/systemd/systemd /usr/bin/apt \
+                   /usr/bin/nmcli /usr/sbin/wpa_supplicant \
+                   /lib/firmware/arm/mali/arch10.8/mali_csffw.bin \
+                   /lib/firmware/conninfra.cfg; do
+            debugfs -R "stat $p" /tmp/rootfs.raw 2>/dev/null | grep -q '^ *Inode:' \
+              || { echo "::error::rootfs 缺少 $p"; exit 1; }
+          done
+          echo "rootfs 校验通过"
+
+      # ────────────────────────────────────────────── 9. 打包启动镜像
+      - name: 打包 boot.img
+        run: |
+          set -euxo pipefail
+          chmod +x scripts/*.sh
+          ./scripts/make-bootimg.sh \
+            --kernel  kernel/out/arch/arm64/boot/Image \
+            --ramdisk ramdisk-proven.lz4 \
+            --firmware firmware \
+            --out     boot-ubuntu.img
+
+      # ────────────────────────────────────────────── 10. 产物
+      - name: 生成校验和
+        run: |
+          set -euxo pipefail
+          {
+            echo "# rubens Ubuntu 26.04 构建产物"
+            echo "# 内核来源: ${{ steps.src.outputs.repo }}"
+            echo "# 分支:     ${{ steps.src.outputs.branch }}"
+            echo "# commit:   ${{ steps.src.outputs.commit }}"
+            echo "# 工作流:   ${{ github.sha }}"
+            echo
+            sha256sum kernel/out/arch/arm64/boot/Image
+            sha256sum kernel/out/arch/arm64/boot/dts/mediatek/mt6895-xiaomi-rubens.dtb
+            sha256sum boot-ubuntu.img
+            sha256sum "$IMG"
+          } | tee SHA256SUMS
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: rubens-ubuntu-2604-${{ github.run_number }}
+          path: |
+            kernel/out/arch/arm64/boot/Image
+            kernel/out/arch/arm64/boot/dts/mediatek/mt6895-xiaomi-rubens.dtb
+            kernel/out/.config
+            boot-ubuntu.img
+            rootfs-builder/out/rootfs-rubens-ubuntu-*-sparse.img
+            rootfs-builder/out/KERNEL-INFO-rubens-ubuntu.txt
+            SHA256SUMS
+          retention-days: 30
+
+      - name: 写入构建摘要
+        if: always()
+        run: ./scripts/ci-summary.sh kernel/out >> "$GITHUB_STEP_SUMMARY"

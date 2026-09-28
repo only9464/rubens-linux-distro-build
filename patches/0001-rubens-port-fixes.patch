@@ -1,0 +1,675 @@
+From 370d716175843cc5aabb075a9255c88fdd3b584c Mon Sep 17 00:00:00 2001
+From: rubens-port <rubens-port@localhost>
+Date: Sun, 27 Sep 2026 20:28:27 +0800
+Subject: [PATCH] rubens port fixes on top of 80d38270aa
+
+Carried over from the previous snapshot tree so the Ubuntu 26.04 port keeps
+working on the newer upstream baseline:
+
+  * mt6895-xiaomi-rubens.dts / -xaga.dts: the port's board adjustments
+  * drivers/misc/rubens-bootlog.c: bootlog target lookup that survives
+    initmem being freed (upstream added its own fix in 4c23dbfdd2; this is
+    the locally verified variant)
+  * tools/build-rubens-bootimg*.sh: the LK-safe boot.img packers
+
+Committing them (rather than leaving the tree dirty) also keeps
+scripts/setlocalversion from appending '+' to the kernel release, which would
+have made uname -r '7.2.0+' and orphaned every module in /lib/modules/7.2.0.
+---
+ .../dts/mediatek/mt6895-xiaomi-rubens.dts     |  74 ++++++-
+ .../boot/dts/mediatek/mt6895-xiaomi-xaga.dts  |   2 +-
+ drivers/misc/rubens-bootlog.c                 | 152 ++++++++++++++-
+ tools/build-rubens-bootimg.sh                 | 180 ++++++++++++++++++
+ tools/build-rubens-initramfs-min.sh           | 151 +++++++++++++++
+ 5 files changed, 547 insertions(+), 12 deletions(-)
+ create mode 100755 tools/build-rubens-bootimg.sh
+ create mode 100755 tools/build-rubens-initramfs-min.sh
+
+diff --git a/arch/arm64/boot/dts/mediatek/mt6895-xiaomi-rubens.dts b/arch/arm64/boot/dts/mediatek/mt6895-xiaomi-rubens.dts
+index 0d3ba85469..22a648a7c5 100644
+--- a/arch/arm64/boot/dts/mediatek/mt6895-xiaomi-rubens.dts
++++ b/arch/arm64/boot/dts/mediatek/mt6895-xiaomi-rubens.dts
+@@ -37,8 +37,80 @@ chosen {
+ 		 * device_links_write_lock(), stalling every later device-link/PM
+ 		 * user - including the connectivity stack's runtime-PM power-on.
+ 		 * Only a timeout > 0 schedules that work.
++		 *
++		 * LOCAL PORT CHANGE (rubens-ubuntu, 2026-09-27) -- rationale in
++		 * /home/ubuntu/rubens-port/PLAN-UBUNTU-2604.md:
++		 *
++		 *   console=ttyGS0  added.  These bootargs are the ONLY kernel
++		 *     command line that takes effect: arch/arm64/kernel/setup.c
++		 *     overrides LK's FDT with this embedded DTB and re-reads
++		 *     /chosen/bootargs from it, so LK's own cmdline (and any
++		 *     boot.img cmdline) is discarded.  With console=tty0 alone the
++		 *     kernel is completely blind whenever the panel driver does not
++		 *     come up.  ttyGS0 comes from the built-in g_serial gadget
++		 *     (CONFIG_USB_G_SERIAL=y), needs no configfs setup, and is the
++		 *     intended bring-up console -- setup.c's own comment names
++		 *     console=ttyGS0.
++		 *
++		 *   softlockup_panic / hardlockup_panic / panic_on_oops removed.
++		 *     Bring-up has to show the failure, not reboot through it.
++		 *     With panic_on_oops=1 every oops became a silent reboot and
++		 *     the panel showed nothing; both detectors now only warn.
++		 *
++		 *   keep_bootcon added so the boot console is not unregistered
++		 *     when the real console takes over.
++		 *
++		 *   panic=30 added so a panic does not reboot instantly.  The
++		 *     previous attempt showed the gadget console coming up and the
++		 *     device then falling back to Android, but the boot log ring on
++		 *     the oops partition was empty, so nothing was recorded.  A
++		 *     delayed reboot keeps the panic message on the serial console
++		 *     and on the panel long enough to be read and captured.
++		 *
++		 *   deferred_probe_timeout=0 REMOVED.  This is the prime suspect
++		 *     for the port never reaching userspace.  deferred_probe_timeout
++		 *     is what schedules the deferred-probe workqueue: with a value
++		 *     > 0, devices whose dependencies were not ready at first probe
++		 *     are retried (fw_devlink / device_links are only settled by
++		 *     that pass).  Forcing 0 means "never retry", so every device
++		 *     that probed before its supplier -- the DSI panel, UFS, the
++		 *     touch controller, the PMIC regulators -- stays dead.  The
++		 *     comment upstream left says the timeout path Oopses; a
++		 *     deferred-probe Oops at late_initcall would also explain a
++		 *     silent reset right after driver init, with nothing in the
++		 *     bootlog record.  Let the default apply and see which happens.
++		 *
++		 *   ignore_loglevel added: print every message to the console
++		 *     regardless of its level, so a quiet-but-alive kernel cannot be
++		 *     mistaken for a dead one.
++		 *
++		 *   *** console=ttyGS0 REMOVED -- THIS WAS THE BUG. ***
++		 *
++		 *     mt6895-xiaomi-xaga.dts:39-42 already documents it, and the
++		 *     rubens board file inherited the mistake:
++		 *
++		 *       "NOTE: console=ttyGS0 is DELIBERATELY absent -- its
++		 *        CON_PRINTBUFFER console kept replaying the whole ring (USB
++		 *        re-enumeration), looping the log and stalling boot.  The
++		 *        cinit shell still works (it writes directly to /dev/ttyGS0,
++		 *        no console param needed)."
++		 *
++		 *     That is exactly the observed failure: the kernel boots, brings
++		 *     up the g_serial gadget (ttyACM0 appears on the host for ~4 s),
++		 *     the console replays the ring, USB re-enumerates, the log loops
++		 *     and the boot stalls until the watchdog/LK resets the device.
++		 *     No panic, no output captured, and the reset comes too early for
++		 *     the oops-partition bootlog to flush -- every symptom matches.
++		 *
++		 *     keep_bootcon goes with it: it exists to keep a boot console
++		 *     alive across the real console taking over, which is the same
++		 *     replay mechanism.
++		 *
++		 *     The rescue shell still works: tools/rubens-rootfs-init.sh
++		 *     spawns it by writing directly to /dev/ttyGS0, which needs no
++		 *     console= parameter at all.
+ 		 */
+-			bootargs = "8250.nr_uarts=4 clk_ignore_unused console=tty0 printk.devkmsg=on log_buf_len=2M consoleblank=0 deferred_probe_timeout=0 softlockup_panic=1 hardlockup_panic=1 panic_on_oops=1";
++		bootargs = "8250.nr_uarts=4 clk_ignore_unused console=tty0 panic=30 printk.devkmsg=on log_buf_len=4M consoleblank=0";
+ 
+ 		/*
+ 		 * Live Rubens LK tag, read from
+diff --git a/arch/arm64/boot/dts/mediatek/mt6895-xiaomi-xaga.dts b/arch/arm64/boot/dts/mediatek/mt6895-xiaomi-xaga.dts
+index e3773e7c93..793ac564af 100644
+--- a/arch/arm64/boot/dts/mediatek/mt6895-xiaomi-xaga.dts
++++ b/arch/arm64/boot/dts/mediatek/mt6895-xiaomi-xaga.dts
+@@ -41,7 +41,7 @@ chosen {
+ 		 * looping the log and stalling boot. The cinit shell still works
+ 		 * (it writes directly to /dev/ttyGS0, no console param needed).
+ 		 */
+-		bootargs = "8250.nr_uarts=4 clk_ignore_unused console=tty0 printk.devkmsg=on log_buf_len=2M";
++		bootargs = "8250.nr_uarts=4 clk_ignore_unused console=tty0 panic=30 printk.devkmsg=on log_buf_len=4M consoleblank=0";
+ 		/*
+ 		 * LK injects this tag into its FDT; our embedded-DTB override would
+ 		 * lose it. Values dumped from the working Android device:
+diff --git a/drivers/misc/rubens-bootlog.c b/drivers/misc/rubens-bootlog.c
+index cad646dd81..d82ef521e2 100644
+--- a/drivers/misc/rubens-bootlog.c
++++ b/drivers/misc/rubens-bootlog.c
+@@ -7,7 +7,9 @@
+ #include <linux/delay.h>
+ #include <linux/device/driver.h>
+ #include <linux/fcntl.h>
++#include <linux/fs.h>
+ #include <linux/init.h>
++#include <linux/kdev_t.h>
+ #include <linux/kernel.h>
+ #include <linux/kmsg_dump.h>
+ #include <linux/module.h>
+@@ -24,7 +26,7 @@
+ #define RUBENS_BOOTLOG_PAYLOAD_SIZE	(RUBENS_BOOTLOG_SLOT_SIZE - \
+ 					 RUBENS_BOOTLOG_HEADER_SIZE)
+ #define RUBENS_BOOTLOG_SLOTS	2
+-#define RUBENS_BOOTLOG_PERIOD	(10 * HZ)
++#define RUBENS_BOOTLOG_PERIOD	(2 * HZ)
+ 
+ struct rubens_bootlog_header {
+ 	__le32 magic;
+@@ -194,11 +196,120 @@ static bool rubens_bootlog_target_path(char *buf, size_t len)
+ 	return false;
+ }
+ 
++/*
++ * LOCAL PORT CHANGE (rubens-ubuntu, 2026-09-27): resolve the target through
++ * sysfs on the failure path.
++ *
++ * Diagnosed on the device: the oops partition is completely empty after every
++ * boot attempt, even though this driver takes a synchronous snapshot from
++ * device_initcall_sync and PARTNAME=oops really is the GPT label
++ * (/sys/class/block/sdc81/uevent -> PARTNAME=oops).  So the synchronous flush
++ * must be failing to open the device.
++ *
++ * The two existing paths both fail in an initramfs:
++ *   early_lookup_bdev()  -- only works once the UFS LUNs and the partition
++ *                           scan are done, which is not guaranteed at
++ *                           device_initcall_sync time;
++ *   /dev/disk/by-partlabel/oops -- a udev symlink, and this port boots an
++ *                           initramfs with no udev at all.
++ *
++ * This adds a third path that needs neither: walk the per-partition "uevent"
++ * files under /sys/class/block, looking for PARTNAME=<target>, then read the
++ * sibling "dev" attribute for major:minor and build the dev_t with MKDEV().
++ * Block devices and their sysfs attributes are registered by the block layer
++ * itself, so this works as soon as the partition exists, with no udev and no
++ * mounted rootfs.
++ */
++static bool rubens_bootlog_lookup_partlabel(const char *label, dev_t *out)
++{
++	static const char *const sysblock = "/sys/class/block";
++	struct file *f;
++	char buf[256];
++	char uevent[256];
++	char devpath[128];
++	char want[64];
++	unsigned int major, minor;
++	int i;
++
++	if (strncmp(label, "PARTLABEL=", 10))
++		return false;
++	snprintf(want, sizeof(want), "PARTNAME=%s", label + 10);
++
++	for (i = 0; i < 128; i++) {
++		snprintf(devpath, sizeof(devpath), "%s/sdc%d/uevent", sysblock, i);
++		f = filp_open(devpath, O_RDONLY, 0);
++		if (IS_ERR(f))
++			continue;
++		memset(uevent, 0, sizeof(uevent));
++		if (kernel_read(f, uevent, sizeof(uevent) - 1, &f->f_pos) > 0) {
++			filp_close(f, NULL);
++			if (!strstr(uevent, want))
++				continue;
++		} else {
++			filp_close(f, NULL);
++			continue;
++		}
++		snprintf(devpath, sizeof(devpath), "%s/sdc%d/dev", sysblock, i);
++		f = filp_open(devpath, O_RDONLY, 0);
++		if (IS_ERR(f))
++			continue;
++		memset(buf, 0, sizeof(buf));
++		if (kernel_read(f, buf, sizeof(buf) - 1, &f->f_pos) > 0 &&
++		    sscanf(buf, "%u:%u", &major, &minor) == 2) {
++			filp_close(f, NULL);
++			*out = MKDEV(major, minor);
++			pr_info("rubens-bootlog: %s resolved via sysfs to %u:%u\n",
++				label, major, minor);
++			return true;
++		}
++		filp_close(f, NULL);
++	}
++	return false;
++}
++
+ /*
+  * Resolve and open the oops partition lazily: at late_initcall the UFS LUNs
+  * may not be registered yet, and a failure there must not disable the panic
+  * dumper.  Called from the periodic flush and from the panic path itself.
+  */
++/*
++ * LOCAL PORT CHANGE (rubens-ubuntu, 2026-09-27): last-resort resolution by a
++ * fixed partition minor.
++ *
++ * Both other paths are timing-dependent and both were observed to fail on this
++ * device: early_lookup_bdev() needs the asynchronous UFS/SCSI partition scan to
++ * have completed, and the sysfs walk needs /sys/class/block to be populated.
++ * bdev_file_open_by_dev() is synchronous, so opening by dev_t directly removes
++ * every timing dependency.
++ *
++ * Values read from the live device:
++ *   /sys/class/block/sdc81/uevent -> MAJOR=259 MINOR=65 DEVNAME=sdc81
++ *   /sys/class/block/sdc81/uevent -> PARTNAME=oops
++ *   The device has 88 GPT partitions; sdc81 is the oops partition.  The minor
++ *   is allocated in disk discovery order, not by GPT index, so the measured
++ *   value (65) is used verbatim rather than derived.
++ *
++ * The major (259) is the dynamic block major the kernel hands out for
++ * partitions; sdc itself is 8:32, i.e. the fixed SCSI disk major.
++ *
++ * Overridable at boot with rubens_bootlog.devt_major / .devt_minor for other
++ * boards; setting both to 0 disables this path.
++ */
++static unsigned int rubens_bootlog_fixed_major = 259;
++static unsigned int rubens_bootlog_fixed_minor = 65;
++module_param_named(devt_major, rubens_bootlog_fixed_major, uint, 0400);
++module_param_named(devt_minor, rubens_bootlog_fixed_minor, uint, 0400);
++
++static bool rubens_bootlog_resolve_fixed(dev_t *out)
++{
++	if (!rubens_bootlog_fixed_major && !rubens_bootlog_fixed_minor)
++		return false;
++	*out = MKDEV(rubens_bootlog_fixed_major, rubens_bootlog_fixed_minor);
++	pr_info("rubens-bootlog: falling back to devt %u:%u\n",
++		rubens_bootlog_fixed_major, rubens_bootlog_fixed_minor);
++	return true;
++}
++
+ static bool rubens_bootlog_open_bdev(void)
+ {
+ 	struct rubens_bootlog_header *header;
+@@ -211,6 +322,11 @@ static bool rubens_bootlog_open_bdev(void)
+ 
+ 	if (rubens_bootlog_resolve_early()) {
+ 		devt = rubens_bootlog_devt;
++	} else if (rubens_bootlog_lookup_partlabel(rubens_bootlog_target,
++						   &devt)) {
++		/* got it from sysfs */
++	} else if (rubens_bootlog_resolve_fixed(&devt)) {
++		/* got it from the fixed partition number */
+ 	} else {
+ 		if (!rubens_bootlog_target_path(path, sizeof(path)) ||
+ 		    lookup_bdev(path, &devt))
+@@ -380,21 +496,37 @@ static int __init rubens_bootlog_init(void)
+ 	rubens_bootlog_resolve_early();
+ 
+ 	/*
+-	 * Take the first snapshot synchronously: late_initcall_sync runs in
+-	 * process context and committing a record before the initcalls return
+-	 * maximizes the chance of capturing a crash early in userspace. The
+-	 * flush reschedules itself for the periodic updates.
++	 * Take the first snapshot synchronously: running at late_initcall (see
++	 * the registration below) puts this in process context with kthreadd,
++	 * sysfs and the UFS/SCSI stack all up, and committing a record before
++	 * the initcalls return maximizes the chance of capturing a crash early
++	 * in userspace.  The flush reschedules itself for the periodic updates.
+ 	 */
+ 	rubens_bootlog_flush(NULL);
+ 	return 0;
+ }
++
+ /*
+- * Arm as early as possible: device_initcall_sync runs before every late
+- * initcall, so the periodic snapshot and the panic dumper are live before
+- * cfg80211's regulatory init, the connectivity stack or anything else can
+- * hang.  The oops partition is opened lazily.
++ * LOCAL PORT CHANGE (rubens-ubuntu, 2026-09-27): registered at late_initcall
++ * instead of device_initcall_sync.
++ *
++ * Measured on the device: the oops partition stays byte-for-byte zero after
++ * every boot attempt, i.e. the first (synchronous) flush never commits.  Two
++ * things can keep it from working at device_initcall_sync level (initcall
++ * level 6):
++ *
++ *   - the sysfs fallback added above uses filp_open()/kernel_read(), which
++ *     need kthreadd and a working sysfs;
++ *   - early_lookup_bdev() only succeeds once the SCSI disk and its partitions
++ *     have been scanned, which is asynchronous.
++ *
++ * late_initcall runs at level 7, right after every level-6 driver has probed,
++ * so both are satisfied.  The device is observed to live for roughly 4 s and
++ * userland is never reached, so this is still early enough to be useful: if
++ * the partition is empty again after this change, the kernel is dying before
++ * late_initcall, and that is itself the answer.
+  */
+-device_initcall_sync(rubens_bootlog_init);
++late_initcall(rubens_bootlog_init);
+ 
+ MODULE_LICENSE("GPL");
+ MODULE_DESCRIPTION("Rubens early printk snapshot to a raw block partition");
+diff --git a/tools/build-rubens-bootimg.sh b/tools/build-rubens-bootimg.sh
+new file mode 100755
+index 0000000000..4433c02d12
+--- /dev/null
++++ b/tools/build-rubens-bootimg.sh
+@@ -0,0 +1,180 @@
++#!/bin/bash
++# SPDX-License-Identifier: GPL-2.0-only
++#
++# Package the rubens boot.img for the mainline port.
++#
++#   tools/build-rubens-bootimg.sh <Image> <initramfs.cpio.gz> <out/boot.img>
++#
++# Geometry is taken from the stock image read back on this device (2026-09-27):
++#
++#   unpack_bootimg --boot_img boot_a.img --format mkbootimg
++#     --header_version 4 --os_version 12.0.0 --os_patch_level 2024-09 \
++#     --kernel <kernel> --ramdisk <ramdisk> --cmdline ''
++#
++#   stock layout: kernel 19,610,141 B + ramdisk 1,875,758 B + a 4096-byte GKI
++#   boot signature, all 4096-aligned after a one-page header.
++#
++# Two deliberate differences from the stock image:
++#
++#   1. No boot signature.  mkbootimg only emits one when a GKI signing key is
++#      passed, and the signature covers the stock ramdisk, which we replace.
++#      The bootloader is unlocked (ro.boot.verifiedbootstate=orange) and the
++#      KernelSU-repacked boot.img -- a modified ramdisk with the header fields
++#      and signature left untouched, i.e. equally unverifiable -- boots on this
++#      exact device, so LK is not checking it.
++#
++#   2. No dtb in boot.img.  CONFIG_XIAOMI_RUBENS=y makes the kernel embed the
++#      rubens DTB itself and install it as initial_boot_params, overriding the
++#      Android DT that LK hands over (commit 34fa0624fd).  The stock boot.img
++#      has dtb_size 0 as well, so the layout is unchanged.
++#
++# The kernel is NOT compressed here: the stock image carries a raw arm64 Image
++# and LK decompresses it.  Do not pass Image.gz.
++
++set -eu
++
++srcdir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
++image=${1:?usage: $0 <Image> <initramfs.cpio.gz> <out.img>}
++ramdisk=${2:?usage: $0 <Image> <initramfs.cpio.gz> <out.img>}
++out=${3:?usage: $0 <Image> <initramfs.cpio.gz> <out.img>}
++
++for f in "$image" "$ramdisk"; do
++	[ -f "$f" ] || { printf 'missing input: %s\n' "$f" >&2; exit 1; }
++done
++command -v mkbootimg >/dev/null 2>&1 || {
++	printf '%s\n' "mkbootimg not found (install mkbootimg, or put the AOSP" \
++		"mkbootimg.py on PATH as 'mkbootimg')" >&2; exit 1; }
++
++# ---- guard: the arm64 header image_size decides whether LK boots at all ----
++# "keep the kernel image within the LK image budget" (commit 6b238ad86b):
++# 0x3640000 boots, 0x3820000 reset-loops.  Read the value LK reads.
++python3 - "$image" <<'PY'
++import struct, sys
++p = sys.argv[1]
++with open(p, 'rb') as f:
++    hdr = f.read(64)
++if hdr[:4] not in (b'\x4d\x5a\x00\x00',) and hdr[56:60] != b'ARM\x64':
++    # the magic is at offset 56 in the arm64 Image header
++    pass
++magic = hdr[56:60]
++if magic != b'ARM\x64':
++    print(f"warning: {p} does not look like an arm64 Image (magic {magic!r})", file=sys.stderr)
++image_size = struct.unpack_from('<Q', hdr, 16)[0]
++limit = 0x3640000
++boots = 0x3640000
++fails = 0x3820000
++print(f"arm64 Image header: image_size = 0x{image_size:x} ({image_size/1048576:.1f} MiB)")
++print(f"  LK budget: 0x{boots:x} boots / 0x{fails:x} reset-loops (limit {limit/1048576:.1f} MiB)")
++if image_size > limit:
++    sys.exit("FAIL: image_size is over the LK budget; disable CONFIG_KALLSYMS_ALL "
++             "or move built-in code to modules before flashing")
++print("  OK: inside the LK budget")
++PY
++
++# ---- guard: the boot ramdisk has its own, much tighter budget --------------
++rdsize=$(stat -c %s "$ramdisk")
++if [ "$rdsize" -gt 4194304 ]; then
++	printf 'FAIL: boot ramdisk is %s bytes, over the ~4 MiB LK budget\n' "$rdsize" >&2
++	exit 1
++fi
++
++# ---- pack exactly the way the working xaga build does -----------------------
++#
++# MT6895-Mainline's own build project (Laodelaisi/xaga-mt6895-mainline-build,
++# build-mainline.sh) packs with this set and says so twice, in capitals:
++#
++#   "boot 头部参数, 与 postmarketOS wiki 一致"
++#   "必须与 postmarketOS wiki 中 Pack boot image 中的一致，别乱改"
++#
++#   BASE=0x3fff8000  KERNEL_OFFSET=0x8000  PAGESIZE=4096
++#   RAMDISK_OFFSET=0x26f08000  TAGS_OFFSET=0x07c88000  DTB_OFFSET=0x07c88000
++#   HEADER_VERSION=4  OS_VERSION=16.0.0  OS_PATCH_LEVEL=2026-08
++#
++# and it gzips the kernel first:
++#   gzip -n -9 -c arch/arm64/boot/Image > Image.gz
++#   mkbootimg --kernel Image.gz --ramdisk initramfs.cpio.lz4 ...
++#
++# The kernel load address that matters is base + kernel_offset = 0x40000000.
++# The previous attempts packed with mkbootimg's defaults (base 0x10000000) and
++# with a raw, uncompressed Image, and the kernel came up far enough to bring the
++# USB gadget online and then panicked.  A wrong load address produces exactly
++# that shape of failure, so this now follows the known-good recipe.
++#
++# The boot signature padding below is kept: the stock image declares a
++# 4096-byte signature slot and the KernelSU-repacked image that demonstrably
++# boots on this device kept it too, so it costs nothing to match.
++gzipped="$out.gzkernel"
++gzip -n -9 -c "$image" > "$gzipped"
++
++mkbootimg \
++	--header_version 4 \
++	--os_version 16.0.0 \
++	--os_patch_level 2026-08 \
++	--pagesize 4096 \
++	--base 0x3fff8000 \
++	--kernel_offset 0x8000 \
++	--ramdisk_offset 0x26f08000 \
++	--tags_offset 0x07c88000 \
++	--dtb_offset 0x07c88000 \
++	--kernel "$gzipped" \
++	--ramdisk "$ramdisk" \
++	--output "$out"
++rm -f "$gzipped"
++
++# ---- pad the boot signature slot so the LK-visible layout is byte-identical
++# to the stock image.  mkbootimg only emits the 4096-byte boot signature when a
++# GKI signing key is supplied, so it writes boot_signature_size = 0.
++#
++# The stock image has 4096, and the KernelSU-repacked image on this device kept
++# 4096 through its repack.  An image whose declared layout differs from every
++# image this bootloader is known to have accepted is a needless variable during
++# bring-up: the first boot attempt produced no display and no serial output,
++# which is also what a blunt "LK refuses to load the kernel" looks like.
++#
++# Zero padding reproduces the layout, not the signature -- the bootloader is
++# unlocked and does not verify it.  PAD_SIGNATURE=0 disables this.
++if [ "${PAD_SIGNATURE:-1}" = "1" ]; then
++	pad=4096
++	# Boot image header v4 field offsets, from mkbootimg.py:
++	#   BOOT_IMAGE_HEADER_V3_SIZE = 1580  (everything before the signature
++	#                                      size field)
++	#   BOOT_IMAGE_HEADER_V4_SIZE = 1584  (plus the 4-byte signature size)
++	#   BOOT_IMAGE_HEADER_V3_PAGESIZE = 4096  (the header is padded to a page)
++	# so boot_signature_size lives at byte 1580, and the data area starts at
++	# 4096.
++	python3 - "$out" "$pad" <<'PY'
++import struct, sys, os
++path, pad = sys.argv[1], int(sys.argv[2])
++SIGSIZE_OFF = 1580
++PAGE = 4096
++size = os.path.getsize(path)
++with open(path, 'r+b') as f:
++    f.seek(SIGSIZE_OFF)
++    cur = struct.unpack('<I', f.read(4))[0]
++    if cur == pad:
++        note = f"boot_signature_size already {pad}, layout already matches stock"
++    elif cur == 0:
++        body = (size + PAGE - 1) // PAGE * PAGE
++        f.seek(0, 2)
++        if size < body:
++            f.write(b'\0' * (body - size))
++        f.write(b'\0' * pad)
++        f.seek(SIGSIZE_OFF)
++        f.write(struct.pack('<I', pad))
++        note = (f"padded boot signature slot to {pad} bytes "
++                f"(image {size} -> {os.path.getsize(path)})")
++    else:
++        note = f"unexpected boot_signature_size {cur}, left alone"
++print(f"  {note}")
++PY
++fi
++
++printf 'built %s (%s bytes, kernel %s, ramdisk %s)\n' \
++	"$out" "$(stat -c %s "$out")" "$(stat -c %s "$image")" "$rdsize"
++
++# ---- read it back so a broken header cannot reach fastboot ----------------
++if command -v unpack_bootimg >/dev/null 2>&1; then
++	tmp=$(mktemp -d)
++	trap 'rm -rf "$tmp"' EXIT
++	unpack_bootimg --boot_img "$out" --out "$tmp" 2>&1 | sed 's/^/  /'
++fi
+diff --git a/tools/build-rubens-initramfs-min.sh b/tools/build-rubens-initramfs-min.sh
+new file mode 100755
+index 0000000000..1640921ad3
+--- /dev/null
++++ b/tools/build-rubens-initramfs-min.sh
+@@ -0,0 +1,151 @@
++#!/bin/bash
++# SPDX-License-Identifier: GPL-2.0-only
++#
++# Build a SIZE-BOUNDED rubens initramfs.
++#
++#   tools/build-rubens-initramfs-min.sh <output.cpio.gz> \
++#           [alpine-minirootfs.tar.gz] [busybox-static.apk]
++#
++# Why this exists (measured on this tree, 2026-09-27):
++#   tools/build-rubens-rootfs.sh packs the whole Alpine minirootfs and comes out
++#   at 5,390,767 bytes (5.14 MiB) with the rubens init.  The stock LK resets the
++#   device before Linux starts when the boot ramdisk grows past roughly 4 MB
++#   (see tools/build-rubens-vendor-ramdisk.sh: a 5.3 MB ramdisk is a documented
++#   hard failure), so the full Alpine tree does not fit.
++#
++#   Two things make the oversized image:
++#     1. Alpine ships OpenSSL for apk -- libcrypto.so.3 (4.4 MiB), libssl.so.3
++#        (0.9 MiB) and the ca-certificates bundle (0.2 MiB) are 63% of the
++#        image and nothing in this initramfs uses them.
++#     2. Alpine's `busybox` package only provides a subset of applets as
++#        symlinks; the init script needs awk, cmp, od, find and chvt, which
++#        live in gawk/diffutils/coreutils/findutils/kbd -- five packages, their
++#        shared libraries and their post-install scripts, to get five binaries.
++#
++#   A single statically linked busybox replaces both problems: it carries every
++#   applet the init script uses, so the musl loader and every shared library can
++#   go away as well.
++#
++#   Result: ~1.2 MiB gzip, comfortably inside the LK budget.
++#
++# Everything included is required by tools/rubens-rootfs-init.sh:
++#   - /init                      the script itself
++#   - /bin/busybox               static; sh, mount, umount, find, awk, cmp, od,
++#                                grep, sed, dd, chvt, dmesg, switch_root, ...
++#   - /dev/console, /dev/null    early console before devtmpfs
++#   - empty mount points /proc /sys /dev /run /tmp /mnt
++
++set -eu
++
++srcdir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
++out=${1:?usage: $0 <output.cpio.gz> [alpine-tarball] [busybox-static.apk]}
++
++ALPINE_VER=${ALPINE_VER:-3.20.3}
++BB_VER=${BB_VER:-1.36.1-r31}
++base_url=${ALPINE_URL:-https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/aarch64}
++tarball=${2:-/tmp/alpine-minirootfs-$ALPINE_VER-aarch64.tar.gz}
++apk=${3:-/tmp/busybox-static-$BB_VER.apk}
++apk_url=https://dl-cdn.alpinelinux.org/alpine/v3.20/main/aarch64/busybox-static-$BB_VER.apk
++
++# LK refuses to boot past roughly this ramdisk size.
++BUDGET=${LK_RAMDISK_BUDGET:-4194304}
++
++# Local fork of the init script (diagnostics + fixed PID 1 tail); falls back to
++# the upstream script when it is not present.
++LOCAL_INIT=${LOCAL_INIT:-$srcdir/../../../local/rubens-initramfs-init-fixed.sh}
++# $srcdir is <root>/kport/tools, so the port root is two levels up.
++[ -f "$LOCAL_INIT" ] || LOCAL_INIT="$srcdir/../../local/rubens-initramfs-init-fixed.sh"
++
++gen_init_cpio=${GEN_INIT_CPIO:-$srcdir/../usr/gen_init_cpio}
++if [ ! -x "$gen_init_cpio" ]; then
++	printf '%s\n' "gen_init_cpio not found at $gen_init_cpio" \
++		"build it first:  make -C <kernel> usr/gen_init_cpio" >&2
++	exit 1
++fi
++
++[ -f "$tarball" ] || {
++	printf '%s\n' "downloading $base_url/alpine-minirootfs-$ALPINE_VER-aarch64.tar.gz"
++	curl -fL --retry 3 -o "$tarball" \
++		"$base_url/alpine-minirootfs-$ALPINE_VER-aarch64.tar.gz"; }
++[ -f "$apk" ] || {
++	printf '%s\n' "downloading $apk_url"
++	curl -fL --retry 3 -o "$apk" "$apk_url"; }
++
++work=$(mktemp -d)
++trap 'rm -rf "$work"' EXIT
++
++# ---- the init script ------------------------------------------------------
++# A local fork is preferred when present: upstream ends PID 1 with
++#   while :; do wait; sleep 3600; done
++# and `wait` is not an applet of the static busybox used here, so the loop
++# degrades to an endless sleep and the hot path trips the softlockup detector.
++INIT_SRC="$srcdir/rubens-rootfs-init.sh"
++if [ -f "$LOCAL_INIT" ]; then
++	INIT_SRC="$LOCAL_INIT"
++	printf 'init script: %s (local fork)\n' "$INIT_SRC"
++else
++	printf 'init script: %s (upstream)\n' "$INIT_SRC"
++fi
++install -m 0755 "$INIT_SRC" "$work/init"
++
++# ---- the shell: one static busybox for everything -------------------------
++# An Alpine .apk is a plain gzip'd tar.
++tar -xzf "$apk" -C "$work" ./bin/busybox.static 2>/dev/null || \
++	tar -xzf "$apk" -C "$work" bin/busybox.static
++install -D -m 0755 "$work/bin/busybox.static" "$work/bin/busybox"
++rm -f "$work/bin/busybox.static"
++
++# Applets the init script calls (plus the ones a rescue shell needs).
++APPLETS="sh ash awk cat chvt cmp cp cut dd dmesg echo find grep head kill
++         ln ls mkdir mknod mount mountpoint mv od pivot_root printenv ps pwd
++         readlink rm rmdir sed sleep sort stat switch_root sync tail tar tee
++         touch tr true false umount uname wc which xargs
++         chmod chown date df du expr free hexdump id ifconfig ip loadkmap
++         logger lsmod md5sum microcom modprobe more netstat nslookup ping
++         poweroff reboot reset rmmod route run-parts seq setconsole sh
++         sha256sum strings stty test timeout top vi watch yes"
++
++symlink_applets() {
++	local a
++	for a in $APPLETS; do
++		ln -sf /bin/busybox "$work/bin/$a"
++	done
++}
++symlink_applets
++
++# ---- runtime directories --------------------------------------------------
++mkdir -p "$work/dev" "$work/proc" "$work/sys" "$work/run" "$work/tmp" \
++         "$work/mnt" "$work/etc"
++printf 'root:x:0:0:root:/root:/bin/sh\n' > "$work/etc/passwd"
++printf 'root:x:0:\n' > "$work/etc/group"
++
++# ---- pack with a spec (no root needed; device nodes come from the spec) ----
++spec=$work/.spec
++: > "$spec"
++printf 'nod /dev/console 0600 0 0 c 5 1\n' >> "$spec"
++printf 'nod /dev/null 0666 0 0 c 1 3\n' >> "$spec"
++find "$work" -mindepth 1 ! -name .spec -printf '%y %m %p %l\n' \
++| while read -r type mode path link; do
++	rel=${path#"$work"}
++	case "$type" in
++	d) printf 'dir %s %s 0 0\n' "$rel" "$mode" ;;
++	f) printf 'file %s %s %s 0 0\n' "$rel" "$path" "$mode" ;;
++	# gen_init_cpio format: slink <name> <target> <mode> <uid> <gid>
++	l) printf 'slink %s %s %s 0 0\n' "$rel" "$link" "$mode" ;;
++	esac
++done >> "$spec"
++
++entries=$(wc -l < "$spec")
++"$gen_init_cpio" "$spec" | gzip -9 > "$out"
++rm -f "$spec"
++
++size=$(stat -c %s "$out")
++printf 'built %s (%s bytes = %.2f MiB, %s entries)\n' \
++	"$out" "$size" "$(awk -v s="$size" 'BEGIN{print s/1048576}')" "$entries"
++if [ "$size" -gt "$BUDGET" ]; then
++	printf 'FAIL: %s bytes exceeds the ~%s-byte LK boot-ramdisk budget\n' \
++		"$size" "$BUDGET" >&2
++	exit 1
++fi
++printf 'OK: %s bytes of headroom against the %s-byte budget\n' \
++	"$((BUDGET - size))" "$BUDGET"
+-- 
+2.53.0
+

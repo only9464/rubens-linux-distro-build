@@ -1,0 +1,33 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# 这个仓库**要提交**的内容（从 GitHub 下载不到的文件）：
+#
+#   firmware/           厂商固件（WiFi / 蓝牙 / Mali / 触摸屏）
+#   ramdisk-proven.lz4  真机验证过能启动的 initramfs 基线
+#   configs/            内核配置
+#   patches/            移植补丁
+#   scripts/            构建脚本
+#
+# 所以 firmware/ 和 ramdisk-proven.lz4 都**不**被忽略。
+# 内核源码与 rootfs 构建器由 workflow 在运行时从 GitHub 克隆。
+# ─────────────────────────────────────────────────────────────────────────────
+
+# workflow 运行时才出现的临时目录
+kernel/
+rootfs-builder/
+out/
+
+# 构建产物
+*.img
+*.img.gz
+SHA256SUMS
+
+# 解包过程中的中间文件
+*.cpio
+*.cpio.gz
+
+# 编辑器与系统文件
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
