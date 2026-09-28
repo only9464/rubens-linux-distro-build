@@ -3,7 +3,11 @@
 #
 # verify-kernel.sh -- 内核编译后的门禁检查
 #
-#   ./scripts/verify-kernel.sh <kernel-out-dir>
+#   ./scripts/verify-kernel.sh <kernel-build-dir>
+#
+# 既接受 `O=out` 的独立输出目录（kernel/out），也接受 in-tree 构建树
+# （构建与源码同目录，即 kernel/）——两种布局的 Image/.config/DTB 相对路径
+# 是一样的，所以只要把传入的目录当成构建根即可。
 #
 # 任何一项失败都应该阻止后续的刷机流程。特别是 image_size：
 # 超过 LK 预算的内核必定复位循环，刷进去只会浪费一次宝贵的槽位重试。

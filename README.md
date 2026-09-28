@@ -66,16 +66,16 @@ cd ..
 git clone https://github.com/MT6895-Mainline/rootfs.git rootfs-builder
 
 # 3. 配置 + 编译（⚠️ 先 dtbs 再 Image）
-#    .config 一定要放进 out/，不能放源码树根！
-#    放源码树根会让内核 Makefile 判定「source tree is not clean」而中止。
-mkdir -p kernel/out && cp configs/kernel.config kernel/out/.config
+#    .config 放源码树根做 in-tree 构建：产出的树就是 rootfs 构建器的缓存形状
+#    （cp -a 过去即可跳过它那次编译）。用 O=out 的话必须写 out/.config。
+cp configs/kernel.config kernel/.config
 cd kernel
-make -C . O=out ARCH=arm64 LLVM=1 dtbs                    # 步骤 1
-LOCALVERSION= make -C . O=out ARCH=arm64 LLVM=1 -j$(nproc) Image modules   # 步骤 2
+make -C . ARCH=arm64 LLVM=1 dtbs                           # 步骤 1
+LOCALVERSION= make -C . ARCH=arm64 LLVM=1 -j$(nproc) Image modules   # 步骤 2
 cd ..
 
 # 4. 检查体积预算（不通过就别刷）
-./scripts/verify-kernel.sh
+./scripts/verify-kernel.sh kernel
 ```
 
 完整流程（含 rootfs 构建、boot.img 打包、刷机）见 **[docs/BUILD.md](docs/BUILD.md)**。
@@ -141,7 +141,7 @@ LK 是厂商 bootloader，有**硬性约束**，违反就复位循环：
 | `scripts/make-bootimg.sh` | ⚠️ **端到端逻辑验证，未刷机** | 生成的 boot.img 与实机验证过的镜像**内核逐字节一致、文件大小一致**，`/init` 的功能点计数全部相同（差异仅为注释）。**但这一份尚未在设备上启动过** |
 | `scripts/flash.sh` | ✅ **实测通过** | 只打印命令，不执行 |
 | `scripts/extract-overlay.sh` | ✅ **实测通过** | 生成了 50 项差分 |
-| `.github/workflows/build.yml` | ⚠️ **结构验证 + 生成步骤离线实测，但未在 CI 跑完** | YAML 可被 `yaml.safe_load` 解析；23 个 step / 21 个 `run` 块通过 `bash -n`；内核来源解析逻辑已离线测试全部 6 种输入组合。三个生成类 step（写入 profile / 写入后端 / 修补 build.sh）已**原样抽出执行**：profile 能被 bash source 且 25 个包、`KERNEL_LOCALVERSION` 为空、`wpasupplicant` 在列；`distros/ubuntu.sh` 语法通过；打补丁后的 `build.sh` 与本地已验证版本**逐字节相同**（md5 `669cee45…`，27 行 TAB 保留）。**仍未拿到一次完整的绿色 CI 运行**，剩余风险在 mmdebstrap 的权限与镜像可达性 |
+| `.github/workflows/build.yml` | ⚠️ **前半段已在 CI 实测通过；后半段未跑** | **已实测通过**：克隆内核 → 应用补丁 → 清理 → 写配置 → 编 dtbs → 编内核与模块 → 门禁校验（run 7 的全部 16 步 ✅，内核能在 CI 里编出来）。三个生成类 step（写入 profile / 写入后端 / 修补 build.sh）已原样抽出执行：打补丁后的 `build.sh` 与本地已验证版本**逐字节相同**（md5 `669cee45…`）。**未验证**：rootfs 构建（mmdebstrap 在容器里的 mount 权限、清华镜像可达性）与 boot.img 打包 |
 | `docs/HARDWARE.md` 的数据 | ✅ **实机采集** | 全部来自设备上的 `dmesg` / `/sys` |
 
 **首次使用时建议**：

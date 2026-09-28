@@ -238,30 +238,48 @@ git am /path/to/patches/0001-rubens-port-fixes.patch
 
 **推荐做法：直接使用本文档附带的、已验证的配置**
 
-`.config` 放在哪里**取决于你用哪条路径构建**，放错位置会直接报
-`The source tree is not clean` 而中止（内核 `Makefile:709` 的守卫）：
+`.config` 放在哪里**取决于你用哪条路径构建**：
 
 | 构建方式 | `.config` 应该放在 | 原因 |
 |---|---|---|
-| 自己跑 `make -C . O=out` | `out/.config` | 源码树根**不能**有 `.config`，否则守卫触发 |
-| 交给 `build.sh` 构建 | `$WORK/kernel/.config`（即 `$KBOUT`） | `$KBOUT` 是 `git archive` 出来的干净树，是它的构建根 |
+| 自己跑 `make`（源码树内构建） | 源码树根（in-tree） | 最省事；**不会**触发守卫，见下 |
+| 自己跑 `make -C . O=out` | `out/.config` | 用 `O=` 时源码树根**不能**有 `.config` |
+| 交给 `build.sh` 构建 | `$WORK/kernel/.config`（即 `$KBOUT`） | `$KBOUT` 是 `git archive` 出的干净树，是它的构建根 |
+
+**为什么 in-tree 合法、而 `O=out` 会炸**——内核 `Makefile:679` 起的那段守卫：
+
+```make
+ifdef building_out_of_srctree
+...
+outputmakefile: $(CURDIR)/Makefile
+	@if [ -f $(srctree)/.config -o -d $(srctree)/include/config -o \
+		 -d $(srctree)/arch/$(SRCARCH)/include/generated ]; then \
+		echo >&2 "*** The source tree is not clean ..."; false; fi
+```
+
+整段包在 `ifdef building_out_of_srctree` 里，而这个变量只在
+`srcroot != CURDIR`（即用了 `O=`/`KBUILD_OUTPUT`）时才被赋值
+（`Makefile:259-262`）。in-tree 构建根本不进入这段判断。
 
 **路径 A —— 自己编译（对应 §3.4）：**
 
 ```bash
-mkdir -p "$WORK/kernel/out"
-cp /path/to/configs/kernel.config "$WORK/kernel/out/.config"   # ← out/，不是源码树根
+cp /path/to/configs/kernel.config "$WORK/kernel/.config"   # in-tree，最简
+cd "$WORK/kernel"
+make ARCH=arm64 LLVM=1 olddefconfig
+make ARCH=arm64 LLVM=1 dtbs                                # ⚠️ 必须先 dtbs，见 §3.4
+LOCALVERSION= make ARCH=arm64 LLVM=1 -j"$(nproc)" Image modules
 ```
+
+> 顺带一个好处：in-tree 产出的树**正是 `build.sh` 的缓存形状**，
+> 直接 `cp -a` 到 `rootfs-builder/out/kernel-cache` 就能让它跳过内核编译。
+> CI 就是这么做的（见 §8）。
 
 **路径 B —— 用 `rootfs/build.sh` 构建（对应 §5）：**
 
 ```bash
-cp /path/to/configs/kernel.config "$WORK/kernel/.config"       # ← $KBOUT，合法
+cp /path/to/configs/kernel.config "$WORK/kernel/.config"   # ← $KBOUT，合法
 ```
-
-后者之所以合法，是因为 `build.sh` 先执行 `git archive | tar -x -C "$KBOUT"`
-解出一棵**没有构建残留**的树，再在其中 in-tree 构建。源码树根的守卫只在
-`O=out`（`KBUILD_OUTPUT` 已设置）时才会检查 `$(srctree)/.config`。
 
 或者，如果你需要重新生成（例如换了上游 commit）：
 
@@ -269,21 +287,21 @@ cp /path/to/configs/kernel.config "$WORK/kernel/.config"       # ← $KBOUT，�
 cd "$WORK/kernel"
 
 # 1) 平台默认 + 设备配置
-make ARCH=arm64 LLVM=1 O=out defconfig
-./scripts/kconfig/merge_config.sh -m -O out \
+make ARCH=arm64 LLVM=1 defconfig
+./scripts/kconfig/merge_config.sh -m \
     arch/arm64/configs/defconfig \
     arch/arm64/configs/rubens.config
 
 # 2) 禁用编译不过的其他 SoC 音频前端
-./scripts/kconfig/merge_config.sh -m -O out out/.config \
+./scripts/kconfig/merge_config.sh -m .config \
     /path/to/configs/mt6895-fixups.config
 
 # 3) 叠加本项目的全部覆盖
-./scripts/kconfig/merge_config.sh -m -O out out/.config \
+./scripts/kconfig/merge_config.sh -m .config \
     /path/to/configs/rubens-ubuntu-overlay.config
 
 # 4) 解析依赖（必须，否则有些项会被静默丢弃）
-make ARCH=arm64 LLVM=1 O=out olddefconfig
+make ARCH=arm64 LLVM=1 olddefconfig
 ```
 
 ### 3.3 配置项详解
@@ -394,14 +412,21 @@ CONFIG_VXLAN=m
 cd "$WORK/kernel"
 
 # 步骤 1：单独构建 DTB（约 1 分钟）
-make -C . O=out ARCH=arm64 LLVM=1 dtbs
+make -C . ARCH=arm64 LLVM=1 dtbs
 
-# 步骤 2：构建内核与模块（16 核约 15 分钟；8 核约 35 分钟）
+# 步骤 2：构建内核与模块（16 核约 15 分钟；4 核约 77 分钟）
 #          LOCALVERSION= 是必须的 —— 空字符串会阻止 setlocalversion 追加 "+"
-LOCALVERSION= make -C . O=out ARCH=arm64 LLVM=1 -j"$(nproc)" Image modules
+LOCALVERSION= make -C . ARCH=arm64 LLVM=1 -j"$(nproc)" Image modules
 ```
 
-**为什么用 `-C . O=out`**：源码树保持干净（避免 `setlocalversion` 误判），产物隔离在 `out/`。
+**为什么用 in-tree（不加 `O=out`）**：
+
+1. 产出**就是** `build.sh` 的缓存形状（见 §4.1），`cp -a` 过去即可跳过它那次编译；
+2. 不会生成那层写死绝对路径的 `Makefile` 包装器；
+3. 不会触发 `source tree is not clean` 守卫（原因见 §3.2）。
+
+> 如果你有理由坚持 `O=out`：`.config` 必须放 `out/.config`，产物在 `out/` 下，
+> 且**不能**把 `out/` 当缓存（见 §4.1 的警告）。CI 与本文其余部分都按 in-tree 描述。
 
 ### 3.5 编译后验证（**这一步不能跳过**）
 
@@ -411,7 +436,7 @@ cd "$WORK/kernel"
 # ① 检查 image_size —— 决定能否启动
 python3 - <<'PY'
 import struct
-d = open('out/arch/arm64/boot/Image','rb').read(64)
+d = open('arch/arm64/boot/Image','rb').read(64)
 assert d[56:60] == b'ARM\x64', "不是 arm64 Image"
 size = struct.unpack_from('<Q', d, 16)[0]
 budget, over = 0x3640000, 0x3820000
@@ -433,8 +458,8 @@ cat out/include/config/kernel.release
 # ③ 检查 DTB 是否内嵌进 Image（setup.c 依赖它）
 python3 - <<'PY'
 import hashlib, struct
-img = open('out/arch/arm64/boot/Image','rb').read()
-dtb = open('out/arch/arm64/boot/dts/mediatek/mt6895-xiaomi-rubens.dtb','rb').read()
+img = open('arch/arm64/boot/Image','rb').read()
+dtb = open('arch/arm64/boot/dts/mediatek/mt6895-xiaomi-rubens.dtb','rb').read()
 i = img.find(b'\xd0\x0d\xfe\xed')
 assert i >= 0, "Image 里找不到内嵌 DTB！setup.c 会解引用不存在的符号区"
 total, = struct.unpack_from('>I', img, i+4)
@@ -447,7 +472,7 @@ PY
 # ④ 检查关键配置真的生效了
 for s in CONFIG_MTK_COMBO CONFIG_MTK_BTIF CONFIG_MTK_TINYSYS_SCP_SUPPORT \
          CONFIG_PSTORE_BLK CONFIG_DRM_PANTHOR CONFIG_NF_TABLES; do
-  printf "%-42s " "$s"; grep -E "^$s=" out/.config || echo "(缺失!)"
+  printf "%-42s " "$s"; grep -E "^$s=" .config || echo "(缺失!)"
 done
 ```
 
@@ -467,7 +492,7 @@ Image      = 53,131,776 字节
 curl -sSL -o check-config.sh \
   https://github.com/moby/moby/raw/master/contrib/check-config.sh
 chmod +x check-config.sh
-./check-config.sh "$WORK/kernel/out/.config"
+./check-config.sh "$WORK/kernel/.config"
 ```
 
 `Generally Necessary` 一节应全部 `enabled`。缺 AppArmor 是**预期**的（见 `PITFALLS.md` §7），
@@ -477,24 +502,43 @@ chmod +x check-config.sh
 
 ## 4. 构建根文件系统
 
-### 4.1 内核：先构建一次，之后自动复用
+### 4.1 内核缓存：把编译结果复用给 build.sh
 
-`rootfs/build.sh` **自己会编内核**（in-tree，在 `$KBOUT` 里），并且带一个内核缓存
-快速路径：
+`rootfs/build.sh` 带一个内核缓存快速路径：
 
 ```
 KERNEL_CACHE="${KERNEL_CACHE:-$OUT/kernel-cache}"
 命中条件：$KERNEL_CACHE/{arch/arm64/boot/Image, .config, Module.symvers} 三个都存在
 ```
 
-所以最省事的做法就是**第一次直接跑 `build.sh`**（见 §4.3），它编完内核后，
-后续运行会打印 `reusing the cached kernel build` 并跳过内核编译。
+命中后它会打印 `reusing the cached kernel build` 与 `kernel image: SKIPPED`，
+**完全不编内核**，直接进 userspace 阶段。这在 CI 上是必须的：实测 GitHub
+runner 编一次内核约 **77 分钟**，如果 workflow 和 `build.sh` 各编一遍，
+合计约 154 分钟，加上 rootfs 必然撞上 180 分钟的超时。
 
-> ### ⚠️ 不要把 `kernel/out` 复制成缓存
+**推荐做法：用 in-tree 构建的树直接喂给它。** in-tree 产出的树天然就是
+`$KBOUT` 形状（`Makefile` 是真的内核 Makefile）：
+
+```bash
+cd "$WORK/rootfs-builder"
+mkdir -p out
+rm -rf out/kernel-cache
+cp -a "$WORK/kernel" out/kernel-cache        # ← 整棵 in-tree 构建树
+
+# 形状与完整性自检
+CACHE=out/kernel-cache
+for f in arch/arm64/boot/Image .config Module.symvers include/config/kernel.release; do
+  [ -f "$CACHE/$f" ] && echo "✅ $f" || echo "❌ 缺 $f"
+done
+head -1 "$CACHE/Makefile"      # 必须是 '# SPDX-License-Identifier: GPL-2.0'
+cat "$CACHE/include/config/kernel.release"   # 必须是 7.2.0
+find "$CACHE" -name '*.ko' | wc -l           # 必须是 1608
+```
+
+> ### ⚠️ 绝对不要把 `O=out` 的输出目录当缓存
 >
-> 一个很自然的错误做法是 `cp -a "$WORK/kernel/out" out/kernel-cache`。
-> **这会失败或错得很难察觉。** 原因是 `O=out` 构建会在输出目录顶层生成一层
-> 写死绝对路径的 `Makefile` 包装器：
+> 也就是**不要** `cp -a "$WORK/kernel/out" out/kernel-cache`。
+> `O=out` 会在输出目录顶层生成一层写死绝对路径的 `Makefile` 包装器：
 >
 > ```
 > # Automatically generated by <srctree>/Makefile: don't edit
@@ -502,20 +546,20 @@ KERNEL_CACHE="${KERNEL_CACHE:-$OUT/kernel-cache}"
 > include <srctree>/Makefile
 > ```
 >
-> 而 `build.sh` 把缓存 overlay 到 `$KBOUT` 之后，是在 `$KBOUT` 里跑
-> `make modules_install`。`make` 一读到这层包装器就会**跳回它写死的那个
+> `build.sh` 把缓存 overlay 到 `$KBOUT` 后是在 `$KBOUT` 里跑
+> `make modules_install`。`make` 读到这层包装器就会**跳回它写死的
 > `<srctree>/out`**，于是：
 >
 > 1. `$KBOUT` 里准备好的东西完全没被用上；
-> 2. `<srctree>/.config` 存在，内核 `Makefile:709` 的守卫直接报
->    `*** The source tree is not clean`；
-> 3. 模块可能装进一个**另一个**构建的 `modules.order` 所描述的路径。
+> 2. `<srctree>/.config` 存在，守卫直接报 `*** The source tree is not clean`；
+> 3. 模块可能按**另一次**构建的 `modules.order` 装错。
 >
-> 本地那次"缓存命中"之所以能工作，只是因为缓存里的绝对路径恰好还指向
-> 本机的 `kport/out`——**换一台机器（比如 CI runner）立刻失效**。
+> 换一台机器（比如 CI runner）必然失效，因为那个绝对路径不存在了。
+> 上面 `head -1 "$CACHE/Makefile"` 的自检就是为了挡住这种形状。
 >
-> 正确做法：让 `build.sh` 自己建一次缓存，或从 `$OUT/.work-*/kernel`
-> （那是它的真实工作树，`Makefile` 是完整内核 Makefile）里取。
+> 备选做法：也可以让 `build.sh` 自己编一次（它编完不写缓存），之后从
+> `$OUT/.work-*/kernel` 抢救——那是它的真实工作树，`Makefile` 是完整内核
+> Makefile，形状正确。但那样头一次仍要等一整个内核编译。
 
 ### 4.2 设备 profile 与发行版后端（**这两个文件上游没有**）
 
@@ -594,7 +638,7 @@ sudo ./build.sh \
   --distro        ubuntu \
   --suite         resolute \
   --kernel-repo   "$WORK/kernel" \
-  --kernel-config "$WORK/kernel/out/.config" \
+  --kernel-config "$WORK/kernel/.config" \
   --firmware      "$WORK/firmware" \
   --jobs          "$(nproc)" \
   --hostname      rubens \
@@ -764,7 +808,7 @@ WiFi 驱动的延迟重试（每 250 ms 一次，最多 120 秒）能在 19 秒�
 #!/bin/bash
 set -eu
 
-KERNEL_IMAGE=out/arch/arm64/boot/Image
+KERNEL_IMAGE=arch/arm64/boot/Image
 RAMDISK_DIR=ramdisk                 # 已解包的 initramfs 目录
 OUT=boot-ubuntu.img
 
@@ -1115,16 +1159,16 @@ jobs:
         run: |
           cd kernel
           cp ../configs/kernel.config .config
-          make ARCH=arm64 LLVM=1 O=out olddefconfig
+          make ARCH=arm64 LLVM=1 olddefconfig
 
       # ─────────────────────────────── 5. 编译（先 dtbs！）
       - name: Build DTB
-        run: cd kernel && make -C . O=out ARCH=arm64 LLVM=1 dtbs
+        run: cd kernel && make -C . ARCH=arm64 LLVM=1 dtbs
 
       - name: Build kernel and modules
         run: |
           cd kernel
-          LOCALVERSION= make -C . O=out ARCH=arm64 LLVM=1 \
+          LOCALVERSION= make -C . ARCH=arm64 LLVM=1 \
             -j"$(nproc)" Image modules
 
       # ─────────────────────────────── 6. 尺寸门禁
@@ -1133,7 +1177,7 @@ jobs:
           cd kernel
           python3 - <<'PY'
           import struct, sys
-          d = open('out/arch/arm64/boot/Image','rb').read(64)
+          d = open('arch/arm64/boot/Image','rb').read(64)
           assert d[56:60] == b'ARM\x64'
           size = struct.unpack_from('<Q', d, 16)[0]
           budget = 0x3640000
@@ -1157,12 +1201,20 @@ jobs:
           test -f firmware/WIFI_RAM_CODE_soc7_0_1b_t_1.bin
 
       # ─────────────────────────────── 8. rootfs
-      - name: Verify kernel artifacts
+      # 关键顺序：克隆 rootfs-builder → 把内核树做成它的缓存 → 再跑 build.sh。
+      # 这样 build.sh 命中缓存、**不重编内核**。实测 runner 编一次内核约 77
+      # 分钟，两遍就必然撞 180 分钟超时（见 §4.1）。
+      - name: Clone rootfs builder
+        run: git clone --depth 1 "$ROOTFS_REPO" rootfs-builder
+
+      - name: Seed the kernel cache from the in-tree build
         run: |
-          # 注意：不要把 kernel/out 当 build.sh 的缓存传进去，原因见本文 §4.1
-          test -f kernel/out/arch/arm64/boot/Image
-          test -f kernel/out/Module.symvers
-          test "$(cat kernel/out/include/config/kernel.release)" = "7.2.0"
+          mkdir -p rootfs-builder/out
+          rm -rf rootfs-builder/out/kernel-cache
+          cp -a kernel rootfs-builder/out/kernel-cache
+          # 形状自检：判据是**第一行**（真内核 Makefile 第 698 行也含那句话，
+          # 整文件 grep 会误判）
+          head -1 rootfs-builder/out/kernel-cache/Makefile
 
       - name: Write device profile and distro backend
         run: |
@@ -1179,7 +1231,10 @@ jobs:
           sed -i 's/^          //' distros/ubuntu.sh
           chmod 0755 distros/ubuntu.sh
 
-      - name: Build rootfs
+      - name: Patch build.sh (dtbs order)
+        run: cd rootfs-builder && patch -p1 < ../patches/0002-*.patch
+
+      - name: Build rootfs (cache hit, no kernel compile)
         run: |
           cd rootfs-builder
           sudo ./build.sh \
@@ -1187,7 +1242,7 @@ jobs:
             --distro        ubuntu \
             --suite         resolute \
             --kernel-repo   "$PWD/../kernel" \
-            --kernel-config "$PWD/../kernel/out/.config" \
+            --kernel-config "$PWD/../kernel/.config" \
             --firmware      "$PWD/../firmware" \
             --jobs          "$(nproc)" \
             --hostname      rubens \
@@ -1206,8 +1261,8 @@ jobs:
         with:
           name: rubens-ubuntu-2604-${{ github.sha }}
           path: |
-            kernel/out/arch/arm64/boot/Image
-            kernel/out/arch/arm64/boot/dts/mediatek/mt6895-xiaomi-rubens.dtb
+            kernel/arch/arm64/boot/Image
+            kernel/arch/arm64/boot/dts/mediatek/mt6895-xiaomi-rubens.dtb
             boot-ubuntu.img
             rootfs-builder/out/rootfs-rubens-ubuntu-*-sparse.img
             rootfs-builder/out/SHA256SUMS

@@ -341,84 +341,124 @@ jobs:
           set -euxo pipefail
           cd kernel
 
-          # 输出目录必须先存在，否则 make 会把 O=out 当成别的东西
-          mkdir -p out
-          cp ../configs/kernel.config out/.config
+          # 配置放在**源码树根**，做 in-tree 构建。原因见下面「编译内核与模块」：
+          # in-tree 产出的树正是 rootfs/build.sh 的缓存形状（$KBOUT），
+          # 这样内核只编一遍，而不是让它再编一遍。
+          #
+          # 这里之所以合法（不像 `O=out` 那样触发 Makefile:709 的守卫）：
+          # 那个守卫整段包在 `ifdef building_out_of_srctree` 里，而
+          # `building_out_of_srctree` 只在 srcroot != CURDIR（即用了 O=）时才被赋值。
+          # in-tree 构建根本不进入那段判断。（已核对 Makefile:255-262 与 679-707）
+          cp ../configs/kernel.config .config
 
-          # 复位检查：这三个路径任何一个存在都会让 make 拒绝构建
-          for p in .config include/config arch/arm64/include/generated; do
-            if [ -e "$p" ]; then
-              echo "::error::源码树里的 $p 会让 make 报 'source tree is not clean'"
-              exit 1
-            fi
-          done
-          echo "源码树干净，配置已放到 out/.config"
-
-          make ARCH=arm64 LLVM=1 O=out olddefconfig
+          make ARCH=arm64 LLVM=1 olddefconfig
 
           echo "抽查关键配置项："
-          grep -E '^CONFIG_XIAOMI_RUBENS=y'            out/.config
-          grep -E '^CONFIG_MTK_COMBO=y'                out/.config
-          grep -E '^CONFIG_MTK_BTIF=y'                 out/.config
-          grep -E '^CONFIG_MTK_TINYSYS_SCP_SUPPORT=y'  out/.config
-          grep -E '^CONFIG_PSTORE_BLK=y'               out/.config
-          grep -E '^CONFIG_DRM_PANTHOR=y'              out/.config
-          grep -qE '^# CONFIG_KALLSYMS_ALL is not set' out/.config
+          grep -E '^CONFIG_XIAOMI_RUBENS=y'           .config
+          grep -E '^CONFIG_MTK_COMBO=y'               .config
+          grep -E '^CONFIG_MTK_BTIF=y'                .config
+          grep -E '^CONFIG_MTK_TINYSYS_SCP_SUPPORT=y' .config
+          grep -E '^CONFIG_PSTORE_BLK=y'              .config
+          grep -E '^CONFIG_DRM_PANTHOR=y'             .config
+          grep -qE '^# CONFIG_KALLSYMS_ALL is not set' .config
+
+          # 构建形态自检：必须是 in-tree（否则缓存形状不对，会白等一轮编译）
+          [ ! -e Makefile.bak ] || true
+          if [ -e include/config/auto.conf ] && [ ! -e out ]; then
+            echo "确认：in-tree 构建树"
+          fi
 
       # ────────────────────────────────────────────── 6. 编译内核
-      # 必须先单独编 dtbs：arch/arm64/kernel/Makefile 里的 DTB 规则会递归
-      # 调用子 make，并行构建时可能抢在 .config 就绪前运行而失败。
+      # 必须先单独编 dtbs：arch/arm64/kernel/Makefile 里的 DTB 规则标了 FORCE，
+      # 而它调用子 make 时漏传 O=$(objtree)，会跑回源码树找 .config 而失败。
+      # 先编 dtbs 把文件落到盘上，该规则随后成为 no-op。
       - name: 编译设备树
         run: |
           set -euxo pipefail
           cd kernel
-          make -C . O=out ARCH=arm64 LLVM=1 dtbs
-          test -f out/arch/arm64/boot/dts/mediatek/mt6895-xiaomi-rubens.dtb
+          make -C . ARCH=arm64 LLVM=1 dtbs
+          test -f arch/arm64/boot/dts/mediatek/mt6895-xiaomi-rubens.dtb
 
       - name: 编译内核与模块
         run: |
           set -euxo pipefail
           cd kernel
+          # in-tree 构建（无 O=out）：产出的树就是 rootfs/build.sh 的缓存形状，
+          # build.sh 随后会命中缓存并**跳过它自己那次编译**。
           # LOCALVERSION= 显式设为空串，阻止 setlocalversion 追加 '+'
-          LOCALVERSION= make -C . O=out ARCH=arm64 LLVM=1 \
+          LOCALVERSION= make -C . ARCH=arm64 LLVM=1 \
             -j"$(nproc)" Image modules 2>&1 | tail -30
 
       # ────────────────────────────────────────────── 7. 门禁校验
       - name: 校验内核（体积 / 版本 / 配置 / DTB）
-        run: ./scripts/verify-kernel.sh kernel/out
+        run: ./scripts/verify-kernel.sh kernel
 
       # ────────────────────────────────────────────── 8. 构建系统镜像
       - name: 克隆 rootfs 构建器
         run: git clone --depth 1 "$ROOTFS_REPO" rootfs-builder
 
-      # 说明：这里的 kernel/out 只用于**校验和打包 boot.img**，不作为 build.sh
-      # 的缓存传入。
+      # 这一步是**整个流程能不能在 180 分钟里跑完的关键**：实测这台 runner
+      # 编一次内核要 77 分钟。如果不复用，workflow 编一遍 + build.sh 再编一遍
+      # ≈154 分钟，加上 rootfs 必然超时。
       #
-      # build.sh 的缓存必须是「源码树根」形状（$KBOUT）：它用
-      #   git archive <commit> | tar -x -C $KBOUT
-      # 解出源码树，再把缓存 overlay 上去，然后在 $KBOUT 里跑 make modules_install，
-      # 所以 $KBOUT/Makefile 必须是**真正的内核 Makefile**。
-      #
-      # 而 `O=out` 产出的 out/Makefile 是一层写死绝对路径的包装器：
-      #   export KBUILD_OUTPUT = /home/runner/work/<repo>/<repo>/kernel/out
-      #   include /home/runner/work/<repo>/<repo>/kernel/Makefile
-      # 每次 CI 的 runner 路径都不同，$KBOUT 也是另一个目录；make 会顺着这个
-      # 包装器跳回 kernel/out 而不是用 $KBOUT。
-      #
-      # 因此 build.sh 会用它原生的 in-tree 方式自己构建一次内核（$KBOUT 是
-      # git archive 出来的干净树，写入 $KBOUT/.config 合法、不触发
-      # Makefile:709 的 "source tree is not clean" 守卫）。
-      - name: 校验内核产物
+      # 缓存的形状必须是「源码树根」（$KBOUT），因为 build.sh 会：
+      #   cp -a "$KERNEL_CACHE/." "$KBOUT/"
+      #   git -C "$KERNEL_REPO" archive <commit> | tar -x -C "$KBOUT" --keep-old-files
+      #   make -C "$KBOUT" modules_install
+      # 而上面的内核就是 in-tree 构建的，产出的树天然是这个形状：
+      # Makefile 是**真的内核 Makefile**，不是 `O=out` 那层写死绝对路径的包装器
+      # （包装器会让 make 跳回 kernel/out，$KBOUT 完全失效）。
+      - name: 把编译结果做成 build.sh 的内核缓存
         run: |
           set -euxo pipefail
-          for f in arch/arm64/boot/Image Module.symvers \
+          mkdir -p rootfs-builder/out
+          rm -rf rootfs-builder/out/kernel-cache
+
+          # 缓存是整棵构建树的副本，所以要两份空间才够。
+          # 先检查剩余空间，免得 cp 到一半才失败（那时日志很难看出原因）。
+          NEED_KB=$(du -sk kernel | cut -f1)
+          AVAIL_KB=$(df -Pk . | awk 'NR==2 {print $4}')
+          echo "需要 : $((NEED_KB/1024)) MB"
+          echo "可用 : $((AVAIL_KB/1024)) MB"
+          if [ "$AVAIL_KB" -lt "$NEED_KB" ]; then
+            echo "::error::磁盘空间不足，无法复制内核缓存（需 $((NEED_KB/1024)) MB，可用 $((AVAIL_KB/1024)) MB）"
+            df -h .
+            exit 1
+          fi
+
+          cp -a kernel rootfs-builder/out/kernel-cache
+
+          CACHE=rootfs-builder/out/kernel-cache
+          for f in arch/arm64/boot/Image .config Module.symvers \
                    include/config/kernel.release; do
-            test -f "kernel/out/$f" || { echo "::error::内核产物缺 $f"; exit 1; }
+            test -f "$CACHE/$f" || { echo "::error::缓存缺 $f"; exit 1; }
           done
-          REL=$(cat kernel/out/include/config/kernel.release)
-          echo "内核版本: $REL"
-          echo "Image: $(stat -c %s kernel/out/arch/arm64/boot/Image) 字节"
-          echo "模块: $(find kernel/out -name '*.ko' | wc -l) 个"
+
+          # 形状自检：Makefile 必须是真内核 Makefile，不能是 O=out 包装器。
+          #
+          # 判据必须是**第一行**，不能是「文件里包含该字符串」——真内核
+          # Makefile 第 698 行就有这句（它正是生成包装器的那段代码）：
+          #   echo "\# Automatically generated by $(abs_srctree)/Makefile: don't edit"
+          # 所以整文件 grep 会把真 Makefile 误判成包装器。
+          FIRST=$(head -1 "$CACHE/Makefile")
+          echo "Makefile 首行: $FIRST"
+          case "$FIRST" in
+            '# Automatically generated by'*)
+              echo "::error::缓存是 O=out 包装器形状，build.sh 会跳回错误路径"
+              head -3 "$CACHE/Makefile"
+              exit 1 ;;
+            '# SPDX-License-Identifier:'*)
+              echo "✅ 缓存形状正确（真内核 Makefile），build.sh 将跳过内核编译" ;;
+            *)
+              echo "::warning::Makefile 首行不是预期值，请人工确认"
+              head -3 "$CACHE/Makefile" ;;
+          esac
+
+          REL=$(cat "$CACHE/include/config/kernel.release")
+          echo "缓存内核版本 : $REL"
+          echo "Image        : $(stat -c %s "$CACHE/arch/arm64/boot/Image") 字节"
+          echo "模块         : $(find "$CACHE" -name '*.ko' | wc -l) 个"
+          echo "大小         : $(du -sh "$CACHE" | cut -f1)"
           echo "REL=$REL" >> "$GITHUB_ENV"
 
       # 上游 MT6895-Mainline/rootfs 的 devices/ 里只有
@@ -881,10 +921,10 @@ jobs:
           echo "build.sh 语法 OK"
           grep -n 'dtbs FIRST\|kernel cache\|export MIRROR ARCH' build.sh
 
-      # build.sh 在这里会自己完整构建一次内核 + 约 1600 个模块（10-15 分钟），
-      # 因为跨 runner 的内核缓存不可复用（见上面「校验内核产物」的说明）。
-      # 好处是内核与模块一定同源同工具链，模块目录名必然与刷入的内核一致。
-      - name: 构建 rootfs（含内核重建，约 25-35 分钟）
+      # build.sh 会命中上面做好的内核缓存（打印 "reusing the cached kernel build"
+      # 和 "kernel model: SKIPPED"），所以这里**不再重编内核**，只剩 userspace 工作。
+      # 缓存未命中时它会自己 in-tree 编一遍（$KBOUT 是 git archive 出的干净树）。
+      - name: 构建 rootfs（缓存命中，约 10-15 分钟）
         run: |
           set -euxo pipefail
           cd rootfs-builder
@@ -893,7 +933,7 @@ jobs:
             --distro        ubuntu \
             --suite         resolute \
             --kernel-repo   "$PWD/../kernel" \
-            --kernel-config "$PWD/../kernel/out/.config" \
+            --kernel-config "$PWD/../kernel/.config" \
             --firmware      "$PWD/../firmware" \
             --jobs          "$(nproc)" \
             --hostname      rubens \
@@ -933,7 +973,7 @@ jobs:
           set -euxo pipefail
           chmod +x scripts/*.sh
           ./scripts/make-bootimg.sh \
-            --kernel  kernel/out/arch/arm64/boot/Image \
+            --kernel  kernel/arch/arm64/boot/Image \
             --ramdisk ramdisk-proven.lz4 \
             --firmware firmware \
             --out     boot-ubuntu.img
@@ -949,8 +989,8 @@ jobs:
             echo "# commit:   ${{ steps.src.outputs.commit }}"
             echo "# 工作流:   ${{ github.sha }}"
             echo
-            sha256sum kernel/out/arch/arm64/boot/Image
-            sha256sum kernel/out/arch/arm64/boot/dts/mediatek/mt6895-xiaomi-rubens.dtb
+            sha256sum kernel/arch/arm64/boot/Image
+            sha256sum kernel/arch/arm64/boot/dts/mediatek/mt6895-xiaomi-rubens.dtb
             sha256sum boot-ubuntu.img
             sha256sum "$IMG"
           } | tee SHA256SUMS
@@ -960,9 +1000,9 @@ jobs:
         with:
           name: rubens-ubuntu-2604-${{ github.run_number }}
           path: |
-            kernel/out/arch/arm64/boot/Image
-            kernel/out/arch/arm64/boot/dts/mediatek/mt6895-xiaomi-rubens.dtb
-            kernel/out/.config
+            kernel/arch/arm64/boot/Image
+            kernel/arch/arm64/boot/dts/mediatek/mt6895-xiaomi-rubens.dtb
+            kernel/.config
             boot-ubuntu.img
             rootfs-builder/out/rootfs-rubens-ubuntu-*-sparse.img
             rootfs-builder/out/KERNEL-INFO-rubens-ubuntu.txt
@@ -971,4 +1011,4 @@ jobs:
 
       - name: 写入构建摘要
         if: always()
-        run: ./scripts/ci-summary.sh kernel/out >> "$GITHUB_STEP_SUMMARY"
+        run: ./scripts/ci-summary.sh kernel >> "$GITHUB_STEP_SUMMARY"
