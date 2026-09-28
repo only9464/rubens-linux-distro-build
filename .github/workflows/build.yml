@@ -91,7 +91,7 @@ jobs:
             device-tree-compiler \
             cpio gzip xz-utils zstd lz4 \
             python3 python3-pip \
-            git rsync curl wget ca-certificates \
+            git rsync patch curl wget ca-certificates \
             mmdebstrap qemu-user-binfmt \
             android-sdk-libsparse-utils \
             mkbootimg
@@ -391,42 +391,479 @@ jobs:
       - name: 克隆 rootfs 构建器
         run: git clone --depth 1 "$ROOTFS_REPO" rootfs-builder
 
-      - name: 放置内核缓存
+      # 说明：这里的 kernel/out 只用于**校验和打包 boot.img**，不作为 build.sh
+      # 的缓存传入。
+      #
+      # build.sh 的缓存必须是「源码树根」形状（$KBOUT）：它用
+      #   git archive <commit> | tar -x -C $KBOUT
+      # 解出源码树，再把缓存 overlay 上去，然后在 $KBOUT 里跑 make modules_install，
+      # 所以 $KBOUT/Makefile 必须是**真正的内核 Makefile**。
+      #
+      # 而 `O=out` 产出的 out/Makefile 是一层写死绝对路径的包装器：
+      #   export KBUILD_OUTPUT = /home/runner/work/<repo>/<repo>/kernel/out
+      #   include /home/runner/work/<repo>/<repo>/kernel/Makefile
+      # 每次 CI 的 runner 路径都不同，$KBOUT 也是另一个目录；make 会顺着这个
+      # 包装器跳回 kernel/out 而不是用 $KBOUT。
+      #
+      # 因此 build.sh 会用它原生的 in-tree 方式自己构建一次内核（$KBOUT 是
+      # git archive 出来的干净树，写入 $KBOUT/.config 合法、不触发
+      # Makefile:709 的 "source tree is not clean" 守卫）。
+      - name: 校验内核产物
         run: |
           set -euxo pipefail
-          cd rootfs-builder
-          mkdir -p out
-          rm -rf out/kernel-cache
-          cp -a ../kernel/out out/kernel-cache
-          # 缓存命中的三个必备文件
-          for f in arch/arm64/boot/Image .config Module.symvers \
+          for f in arch/arm64/boot/Image Module.symvers \
                    include/config/kernel.release; do
-            test -f "out/kernel-cache/$f" || { echo "::error::缓存缺 $f"; exit 1; }
+            test -f "kernel/out/$f" || { echo "::error::内核产物缺 $f"; exit 1; }
           done
-          REL=$(cat out/kernel-cache/include/config/kernel.release)
-          echo "缓存内核版本: $REL"
+          REL=$(cat kernel/out/include/config/kernel.release)
+          echo "内核版本: $REL"
+          echo "Image: $(stat -c %s kernel/out/arch/arm64/boot/Image) 字节"
+          echo "模块: $(find kernel/out -name '*.ko' | wc -l) 个"
           echo "REL=$REL" >> "$GITHUB_ENV"
 
-      - name: 调整设备配置
+      # 上游 MT6895-Mainline/rootfs 的 devices/ 里只有
+      #   pearl.conf  qqcandy.conf  rubens.conf  xaga.conf
+      # 没有 rubens-ubuntu.conf —— 那是本地迭代时新建的 profile。
+      # 同理 distros/ 里只有 debian.sh，没有 ubuntu.sh。
+      # 这两个文件都不在 GitHub 上，所以由 workflow 现场生成。
+      - name: 写入设备 profile
         run: |
           set -euxo pipefail
           cd rootfs-builder
-          # 确保 wpasupplicant 在包列表里 —— 缺了它 NetworkManager
-          # 完全没有无线能力，wlan0 永远是 unavailable
-          if ! grep -q 'wpasupplicant' devices/rubens-ubuntu.conf; then
-            sed -i 's/wireless-regdb \\/wireless-regdb wpasupplicant \\/' \
-              devices/rubens-ubuntu.conf
-          fi
-          if [ "${{ inputs.build_desktop }}" = "true" ]; then
-            # 把 GNOME 桌面打进镜像
-            if ! grep -q 'ubuntu-desktop-minimal' devices/rubens-ubuntu.conf; then
-              sed -i 's/curl wget htop tmux ca-certificates apt-utils/curl wget htop tmux ca-certificates apt-utils ubuntu-desktop-minimal/' \
-                devices/rubens-ubuntu.conf
-            fi
-          fi
-          grep -A6 'PACKAGES_EXTRA' devices/rubens-ubuntu.conf
+          mkdir -p devices
+          cat > devices/rubens-ubuntu.conf <<'CONF_EOF'
+          # Device profile: Xiaomi Redmi K50 (rubens) -- Ubuntu 26.04 LTS
+          #
+          # 由 .github/workflows/build.yml 生成：上游 rootfs 仓库没有这个
+          # profile，只有面向 Debian 的 devices/rubens.conf。
+          #
+          # 内核侧：MT6895-Mainline/linux @ port/rubens-clean (Linux 7.2.0)。
+          # CONFIG_XIAOMI_RUBENS=y 让 Image 自带 rubens DTB，setup.c 会覆盖
+          # LK 传进来的 FDT，所以 boot.img 的 cmdline 是被忽略的。
+          DISTRO="ubuntu"
+          SUITE="resolute"
 
-      - name: 构建 rootfs（约 10 分钟）
+          PLATFORM_NAME="Xiaomi Redmi K50 (rubens)"
+          SOC="mt6895"
+
+          KERNEL_BRANCH="HEAD"
+          KERNEL_CONFIGS="rubens.config"
+          DTS="mt6895-xiaomi-rubens.dts"
+
+          # rubens 移植用 clang 构建（make LLVM=1）；模块必须来自同一工具链。
+          KERNEL_MAKE_ARGS="LLVM=1"
+
+          # 空值 = 内核版本就是 7.2.0，不带 "+" 后缀。
+          # 模块目录名必须与刷入的内核所报告的一致，否则一个模块都加载不了。
+          KERNEL_LOCALVERSION=""
+
+          # 根文件系统：userdata 分区（本机 226 GiB）里的 ext4，
+          # 由 mkfs.ext4 -L <label> 创建；initramfs 按 GPT 分区名找到它。
+          ROOTFS_LABEL="mt6895rubens"
+
+          # Ubuntu base 自带 uid 1000 的 ubuntu 用户；build.sh 会为它写
+          # 免密 sudo 规则（默认的 mobian 用户不存在）。
+          DEFAULT_USER="ubuntu"
+
+          # 内核设备节点（不是 fastboot 名字），取自本机：
+          #   adb shell su -c 'ls -l /dev/block/by-name/{userdata,nvdata}'
+          USERDATA_PART="/dev/sdc86"
+          NVDATA_PART="/dev/sdc13"
+
+          PACKAGES_CORE="systemd systemd-sysv systemd-resolved openssh-server sudo kmod"
+
+          # 先做 CLI 可用性：不带桌面环境。以下都在 resolute 的 main/universe 里；
+          # distros/ubuntu.sh 逐个安装，装不上的只报告不失败。
+          #
+          # wpasupplicant 必须有 —— 缺了它 NetworkManager 完全没有无线能力，
+          # wlan0 会永远是 unavailable。
+          PACKAGES_EXTRA="network-manager bluez modemmanager iio-sensor-proxy \
+                          alsa-ucm-conf alsa-utils usbutils pciutils iproute2 \
+                          ethtool iw rfkill wireless-regdb wpasupplicant \
+                          less nano zstd e2fsprogs dosfstools \
+                          curl wget htop tmux ca-certificates apt-utils"
+
+          # 厂商固件必须提供的文件（自带 blob，用 --firmware 安装，不在此分发）。
+          FIRMWARE_HINTS="mediatek/mt6895/WIFI mediatek/mt6895/*.bin mali_csffw.bin"
+          CONF_EOF
+          # heredoc 里为对齐 YAML 而带的前导空格必须去掉，否则 profile 里
+          # 的续行反斜杠与变量赋值都会被缩进破坏。
+          sed -i 's/^          //' devices/rubens-ubuntu.conf
+
+          # 自检：去掉缩进后不应再有任何行以空格开头，也不应有 YAML 缩进残留。
+          if grep -qE '^ ' devices/rubens-ubuntu.conf; then
+            echo "::error::profile 仍带缩进，续行会被破坏"; exit 1
+          fi
+          for v in DISTRO SUITE KERNEL_LOCALVERSION DEFAULT_USER \
+                   ROOTFS_LABEL USERDATA_PART NVDATA_PART; do
+            grep -qE "^${v}=" devices/rubens-ubuntu.conf \
+              || { echo "::error::profile 缺 ${v}"; exit 1; }
+          done
+
+          # 桌面输入：把 GNOME 最小桌面追加进包列表（镜像会从约 130 MB
+          # 涨到约 1.5 GB）。distros/ubuntu.sh 逐个装包，装不上只报告。
+          if [ "${{ inputs.build_desktop }}" = "true" ]; then
+            sed -i 's/ca-certificates apt-utils"/ca-certificates apt-utils ubuntu-desktop-minimal"/' \
+              devices/rubens-ubuntu.conf
+            echo "已加入 ubuntu-desktop-minimal"
+          fi
+          echo "--- 生成的 profile ---"
+          cat devices/rubens-ubuntu.conf
+
+      # 上游 distros/ 只有 debian.sh。Ubuntu 的 arm64 在 ports 源上
+      # （archive.ubuntu.com 没有 arm64 包），必须有独立后端。
+      - name: 写入 Ubuntu 发行版后端
+        run: |
+          set -euxo pipefail
+          cd rootfs-builder
+          mkdir -p distros
+          cat > distros/ubuntu.sh <<'UBUNTU_SH_EOF'
+          #!/usr/bin/env bash
+          # Ubuntu backend for build.sh
+          #
+          # build.sh 调用约定：
+          #   distro_bootstrap <rootfs> <suite> <arch> <mirror> <jobs>
+          #   distro_configure <rootfs> <suite>
+          #
+          # 与 distros/debian.sh 的区别：arm64 不是 Ubuntu 的主架构，
+          # 归档在 ports.ubuntu.com/ubuntu-ports，而不是
+          # archive.ubuntu.com/ubuntu。pocket 短名（如 resolute）一致，
+          # 所以 <suite>/<suite>-updates/<suite>-security 三段同名可用。
+          #
+          # 已对 Ubuntu 26.04 LTS "Resolute Raccoon" 验证。
+
+          # Ubuntu 没有 non-free-firmware 组件；固件在 main 里，
+          # 设备 blob 由 --firmware 提供。
+          UBUNTU_COMPONENTS="${UBUNTU_COMPONENTS:-main,universe}"
+
+          # 默认镜像：清华 TUNA，含完整 Ubuntu ports arm64 归档。
+          # 可用 --mirror 或 UBUNTU_PORTS_MIRROR 覆盖。
+          # 备选：mirrors.ustc.edu.cn / mirrors.aliyun.com / mirrors.huaweicloud.com
+          UBUNTU_PORTS_MIRROR="${UBUNTU_PORTS_MIRROR:-https://mirrors.tuna.tsinghua.edu.cn/ubuntu-ports}"
+
+          # Ubuntu 专有包名。device profile 的 PACKAGES_CORE / PACKAGES_EXTRA
+          # 与 Debian 后端共用，所以只在 Ubuntu 上叫法不同的包列在这里并合并。
+          UBUNTU_PACKAGES_CORE="systemd systemd-sysv systemd-resolved \
+                                openssh-server sudo kmod locales tzdata"
+
+          distro_bootstrap() {
+          	local rootfs="$1" suite="$2" arch="$3" mirror="$4" jobs="$5"
+          	local components="$UBUNTU_COMPONENTS"
+          	local pkgs
+          	pkgs="$(printf '%s %s %s' "${UBUNTU_PACKAGES_CORE:-}" \
+          		"${PACKAGES_CORE:-}" "${PACKAGES_EXTRA:-}" \
+          		| tr -s ' ' | sed 's/^ //; s/ $//')"
+
+          	# arm64 在 ports 归档上；只在调用方没显式给 --mirror 时覆盖。
+          	if [ -z "$mirror" ] && [ "$arch" != "amd64" ] && [ "$arch" != "i386" ]; then
+          		mirror="$UBUNTU_PORTS_MIRROR"
+          		echo "ubuntu/ports: using $mirror for $arch"
+          	fi
+
+          	if ! [ -e /proc/sys/fs/binfmt_misc/qemu-aarch64 ]; then
+          		echo "warning: qemu-aarch64 binfmt handler not registered;" \
+          		     "install qemu-user-static + binfmt-support" >&2
+          	fi
+
+          	# mmdebstrap 把镜像当**位置参数**，不是选项：
+          	#     mmdebstrap [OPTION...] SUITE TARGET [MIRROR...]
+          	# 传 --mirror=$url 会以 "Unknown option: mirror" 中止。
+          	# 下面的数组在有没有镜像时都能安全展开。
+          	local mirror_args=()
+          	[ -n "$mirror" ] && mirror_args=("$mirror")
+
+          	mmdebstrap \
+          		--architectures="$arch" \
+          		--variant=important \
+          		--components="$components" \
+          		--include="$pkgs" \
+          		--aptopt='Apt::Install-Recommends "false"' \
+          		--aptopt='Acquire::Retries "3"' \
+          		--dpkgopt='path-exclude=/usr/share/doc/*' \
+          		--dpkgopt='path-exclude=/usr/share/man/*' \
+          		--dpkgopt='path-exclude=/usr/share/locale/*' \
+          		"$suite" "$rootfs" ${mirror_args[@]+"${mirror_args[@]}"}
+
+          	# 这些设备上必须有真正的 init 系统
+          	if ! [ -e "$rootfs/usr/lib/systemd/systemd" ]; then
+          		echo "error: systemd missing in the bootstrapped rootfs" >&2
+          		return 1
+          	fi
+          	# boot.img 里的 initramfs 会执行 switch_root <fs> /sbin/init
+          	if ! [ -e "$rootfs/sbin/init" ]; then
+          		echo "warning: /sbin/init missing; linking it to systemd" >&2
+          		mkdir -p "$rootfs/sbin"
+          		ln -sf /lib/systemd/systemd "$rootfs/sbin/init" 2>/dev/null || true
+          	fi
+          }
+
+          distro_configure() {
+          	local rootfs="$1" suite="$2"
+          	local user="${DEFAULT_USER:-ubuntu}"
+          	local mirror="${MIRROR:-$UBUNTU_PORTS_MIRROR}"
+          	local arch="${ARCH:-arm64}"
+
+          	# ---------------------------------------------------------- sources
+          	# 必须最先做：ubuntu-base / mmdebstrap 的默认值指向
+          	# archive.ubuntu.com，那里没有 arm64 包。
+          	cat > "$rootfs/etc/apt/sources.list" <<EOF
+          # MT6895-Mainline rootfs (Ubuntu $suite/$arch).  universe 为设备支持包
+          # （NetworkManager、BlueZ、ModemManager 等）而启用。
+          deb $mirror $suite main universe
+          deb $mirror $suite-updates main universe
+          deb $mirror $suite-security main universe
+          EOF
+
+          	# ---------------------------------------------------------- apt setup
+          	if [ -e "$rootfs/etc/resolv.conf" ] || [ -L "$rootfs/etc/resolv.conf" ]; then
+          		:
+          	else
+          		printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' > "$rootfs/etc/resolv.conf"
+          	fi
+
+          	# ---------------------------------------------------------- locale/tz
+          	chroot "$rootfs" /bin/sh -c '
+          		set -e
+          		if [ -x /usr/sbin/locale-gen ]; then
+          			echo "en_US.UTF-8 UTF-8" > /etc/locale.gen
+          			echo "zh_CN.UTF-8 UTF-8" >> /etc/locale.gen
+          			locale-gen >/dev/null 2>&1 || true
+          		fi
+          		ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
+          		echo Asia/Shanghai > /etc/timezone
+          	' || true
+
+          	# ---------------------------------------------------------- extra pkgs
+          	# 逐个安装设备支持包：某个包在这个 Ubuntu 版本里不存在时，
+          	# 不至于让整个 bootstrap 失败，每一次缺失都会被报告。
+          	local pkgs
+          	pkgs="$(printf '%s %s' "${PACKAGES_EXTRA:-}" | tr -s ' ' | sed 's/^ //; s/ $//')"
+          	if [ -n "$pkgs" ]; then
+          		chroot "$rootfs" /bin/sh -c 'apt-get update -qq' || \
+          			echo "warning: apt-get update failed" >&2
+          		for p in $pkgs; do
+          			if chroot "$rootfs" /bin/sh -c \
+          				"DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends $p" \
+          				>/dev/null 2>&1; then
+          				echo "  installed: $p"
+          			else
+          				echo "  SKIPPED (not installable in $suite): $p" >&2
+          			fi
+          		done
+          	fi
+
+          	# ---------------------------------------------------------- default user
+          	# Ubuntu base 自带 ubuntu 用户；profile 可以要求另一个名字。
+          	if ! chroot "$rootfs" /bin/sh -c "id $user" >/dev/null 2>&1; then
+          		chroot "$rootfs" /bin/sh -c "
+          			set -e
+          			useradd -m -s /bin/bash -G sudo,audio,video,render,plugdev,netdev,dialout $user
+          			passwd -d $user
+          		" || echo "warning: could not create user $user" >&2
+          	fi
+
+          	# ---------------------------------------------------------- services
+          	for unit in systemd-networkd systemd-resolved ssh NetworkManager \
+          		    bluetooth ModemManager iio-sensor-proxy; do
+          		chroot "$rootfs" systemctl enable "$unit" >/dev/null 2>&1 || true
+          	done
+
+          	# MT6895-Mainline：首次启动把根文件系统扩展到整个分区
+          	chroot "$rootfs" systemctl enable mt6895-firstboot.service >/dev/null 2>&1 || true
+
+          	# ---------------------------------------------------------- wifi db
+          	# 确保 initramfs 里的 regulatory.db 副本有来源。
+          	if [ ! -e "$rootfs/lib/firmware/regulatory.db" ] && \
+          	   [ -e "$rootfs/usr/lib/firmware/regulatory.db" ]; then
+          		mkdir -p "$rootfs/lib/firmware"
+          		cp -a "$rootfs/usr/lib/firmware/regulatory.db" \
+          		      "$rootfs/usr/lib/firmware/regulatory.db.p7s" \
+          		      "$rootfs/lib/firmware/" 2>/dev/null || true
+          	fi
+
+          	# ---------------------------------------------------------- apt hygiene
+          	rm -rf "$rootfs/var/lib/apt/lists"/* "$rootfs/var/cache/apt"/* 2>/dev/null || true
+          }
+          UBUNTU_SH_EOF
+          sed -i 's/^          //' distros/ubuntu.sh
+          chmod 0755 distros/ubuntu.sh
+          bash -n distros/ubuntu.sh
+          echo "ubuntu.sh 语法 OK（$(wc -l < distros/ubuntu.sh) 行）"
+
+      # 上游 build.sh 有两个必须修的问题（否则内核根本编不出来）：
+      #
+      # 1. `make vmlinux` 之前没先 `make dtbs`。CONFIG_XIAOMI_RUBENS=y 让
+      #    arch/arm64/kernel/Makefile 依赖板级 DTB（要 objcopy 成
+      #    rubens-dtb.o，setup.c 再把它装成 initial_boot_params 覆盖 LK 的
+      #    FDT）。而生成该 DTB 的规则忘了传 O=$(objtree)，子 make 会跑回源码
+      #    树、找不到 .config 而死在：
+      #        *** Configuration file ".config" not found!
+      #    由于规则标了 FORCE，它每次构建都触发，所以失败总是落在 vmlinux
+      #    上——这也正是单独跑 `make dtbs` 看起来正常的原因。
+      #    先编 dtbs 会把文件落到盘上，该规则随后成为 no-op。
+      #
+      # 2. 每次运行都 rm -rf 工作目录并完整重编内核 + 约 1600 个模块
+      #    （10-15 分钟），而这与 userspace 步骤（镜像源、包列表、overlay）
+      #    完全无关。补丁加入 $OUT/kernel-cache 快速路径，让已有产物可直接复用。
+      #
+      # 补丁用 patch(1) 施加；下面是原样嵌入的上游 diff。
+      - name: 修补 build.sh（dtbs 顺序 + 内核缓存）
+        run: |
+          set -euxo pipefail
+          cd rootfs-builder
+          cat > /tmp/0002-kernel-cache.patch <<'PATCH_EOF'
+          diff --git a/build.sh b/build.sh
+          index d85a804..70c5425 100755
+          --- a/build.sh
+          +++ b/build.sh
+          @@ -141,8 +141,59 @@ KBOUT="$WORK/kernel"
+           STUB="rootfs-$DEVICE$NAME_SUFFIX-$TS"
+           BASE="$STUB.img"
+           IMGF="$OUT/$BASE"
+          +
+          +# ---------------------------------------------------------------- kernel cache
+          +# Compiling the kernel and its ~1500 modules takes 10-15 minutes and does not
+          +# depend on anything that changes while iterating on the userspace steps
+          +# (mmdebstrap mirror, package list, overlay, ...).  Rebuilding it on every run
+          +# wastes that time and, because the kernel build is the first thing to fail,
+          +# it also hides later problems behind it.
+          +#
+          +# When KERNEL_CACHE is set to a directory that already contains a finished
+          +# build (an `out/`-style tree: arch/arm64/boot/Image + .config + Module.symvers
+          +# + the .ko files), that tree is copied into the work area and steps 0-2 are
+          +# skipped entirely.  Populate it with:  KERNEL_CACHE=/path ./build.sh ...
+          +# on a successful run, or by copying a previous work directory.
+          +# The cache path is IMPLICIT on purpose: $OUT/kernel-cache.
+          +#
+          +# Relying on an exported KERNEL_CACHE does not work here because build.sh runs
+          +# under sudo, and Ubuntu's sudoers has env_reset set, which drops arbitrary
+          +# environment variables even when `sudo -E` is used.  Looking in a fixed place
+          +# removes that failure mode entirely.
+          +#
+          +# KERNEL_CACHE can still be set explicitly to point somewhere else.
+          +KERNEL_CACHE="${KERNEL_CACHE:-$OUT/kernel-cache}"
+          +CACHE_HIT=0
+          +if [ -f "$KERNEL_CACHE/arch/arm64/boot/Image" ] \
+          +   && [ -f "$KERNEL_CACHE/.config" ] && [ -f "$KERNEL_CACHE/Module.symvers" ]; then
+          +	CACHE_HIT=1
+          +fi
+          +echo "kernel cache: $KERNEL_CACHE (hit=$CACHE_HIT)"
+          +if [ "$CACHE_HIT" = "1" ]; then
+          +	# The module directory name has to match what the flashed kernel reports,
+          +	# or none of the modules load.  The cache records it in
+          +	# include/config/kernel.release; refuse a cache whose release disagrees
+          +	# with the Makefile version we are about to report.
+          +	cached_rel="$(cat "$KERNEL_CACHE/include/config/kernel.release" 2>/dev/null || true)"
+          +	if [ -z "$cached_rel" ]; then
+          +		echo "  warning: cache has no include/config/kernel.release; not using it"
+          +		CACHE_HIT=0
+          +	fi
+          +	echo "  cached kernel release: ${cached_rel:-<unknown>}"
+          +	echo "  cached Image:          $(stat -c%s "$KERNEL_CACHE/arch/arm64/boot/Image") bytes"
+          +	echo "  cached modules:        $(find "$KERNEL_CACHE" -name '*.ko' | wc -l) .ko"
+          +fi
+          +
+           rm -rf "$WORK"
+           mkdir -p "$ROOTFS" "$KBOUT" "$OUT"
+          +if [ "$CACHE_HIT" = "1" ]; then
+          +	log "0. reusing the cached kernel build from $KERNEL_CACHE"
+          +	cp -a "$KERNEL_CACHE/." "$KBOUT/"
+          +	# the exported source tree is still needed for `modules_install` and for
+          +	# the version info below
+          +	git -C "$KERNEL_REPO" archive --format=tar "$KERNEL_REF" \
+          +		| tar -x -C "$KBOUT" --keep-old-files 2>/dev/null || true
+          +fi
+           # The script runs as root, but later CI steps (build info) write into --out as
+           # the invoking user, so hand the directory over when sudo tells us who that is.
+           if [ -n "${SUDO_UID:-}" ] && [ -n "${SUDO_GID:-}" ]; then
+          @@ -231,7 +282,46 @@ if [ -n "${KERNEL_LOCALVERSION:-}" ]; then
+           fi
+           echo "kernel release (module directory): $KVER"
+           
+          +# ---------------------------------------------------------------- cache fast path
+          +# When KERNEL_CACHE supplied a finished build, steps 2/2b are pure waste: the
+          +# Image, .config, Module.symvers and every .ko are already in $KBOUT.  Skip
+          +# straight to the userspace work, which is what actually needs iterating on.
+          +if [ "$CACHE_HIT" = "1" ]; then
+          +	log "2. kernel image: SKIPPED (cache hit)"
+          +	KIMAGE="$KBOUT/arch/arm64/boot/Image"
+          +	[ -f "$KIMAGE" ] || die "cache is missing arch/arm64/boot/Image"
+          +	echo "  Image:   $(stat -c%s "$KIMAGE") bytes"
+          +	echo "  modules: $(find "$KBOUT" -name '*.ko' | wc -l) .ko files"
+          +	# KVER must match the cache; the module dir name decides whether they load
+          +	KVER="$(cat "$KBOUT/include/config/kernel.release" 2>/dev/null || echo "$KVER_MAKEFILE")"
+          +	echo "  kernel release from cache: $KVER"
+          +else
+           log "2. build the kernel image"
+          +# ---------------------------------------------------------------- dtbs FIRST
+          +# `make dtbs` MUST run before `make vmlinux` on these branches.
+          +#
+          +# CONFIG_XIAOMI_RUBENS makes arch/arm64/kernel/Makefile depend on the board DTB
+          +# so it can objcopy it into rubens-dtb.o (setup.c then installs it as
+          +# initial_boot_params, overriding LK's FDT).  The rule that is supposed to
+          +# generate that DTB is broken:
+          +#
+          +#   $(srctree)/arch/arm64/boot/dts/mediatek/mt6895-xiaomi-rubens.dtb: FORCE
+          +#       $(Q)$(MAKE) -C $(srctree) ARCH=arm64 LLVM=1 mediatek/mt6895-xiaomi-rubens.dtb
+          +#
+          +# It passes no O=$(objtree), so the sub-make runs in the SOURCE tree, finds no
+          +# .config and dies with:
+          +#   *** Configuration file ".config" not found!
+          +#   make[6]: *** [Makefile:892: .config] Error 1
+          +#   make[5]: *** [.../arch/arm64/kernel/Makefile:86: ...rubens.dtb] Error 2
+          +# Because the rule is marked FORCE it fires on every build, so the failure
+          +# always lands on vmlinux -- and only on vmlinux, which is why a plain
+          +# `make dtbs` looks like it works.
+          +#
+          +# Building dtbs first leaves the file on disk, so the broken rule becomes a
+          +# no-op for the rest of the build.
+          +# shellcheck disable=SC2086
+          +make -j"$JOBS" $KERNEL_MAKE_ARGS dtbs
+          +
+           # `make modules` on its own cannot work in a fresh tree: modpost has no
+           # vmlinux.symvers yet and reports every core symbol as undefined.  Building
+           # vmlinux first produces it (and gives us the Image the modules belong to,
+          @@ -240,18 +330,23 @@ log "2. build the kernel image"
+           make -j"$JOBS" $KERNEL_MAKE_ARGS vmlinux
+           KIMAGE="$KBOUT/arch/arm64/boot/Image"
+           [ -f "$KIMAGE" ] || echo "warning: no Image at $KIMAGE"
+          -# best effort: some branches embed the DTB in the Image instead (pearl does)
+          -# shellcheck disable=SC2086
+          -make -j"$JOBS" $KERNEL_MAKE_ARGS dtbs >/dev/null 2>&1 || true
+           
+           log "2b. build modules"
+           # shellcheck disable=SC2086
+           make -j"$JOBS" $KERNEL_MAKE_ARGS modules
+          +fi   # end of cache fast path / kernel build
+           
+           # ---------------------------------------------------------------- userspace
+           log "3. bootstrap $DISTRO_NAME/$SUITE ($ARCH)"
+           # shellcheck source=/dev/null
+           . "$HERE/distros/$DISTRO_NAME.sh"
+          +# Export the mirror and arch so both distro_bootstrap (called with them as
+          +# arguments) and distro_configure (which reads $MIRROR / $ARCH from the
+          +# environment, see distros/ubuntu.sh) resolve to the SAME archive.  Without
+          +# this, a backend that defaults its mirror can end up writing a sources.list
+          +# that points somewhere other than the one the bootstrap used.
+          +export MIRROR ARCH
+          +MIRROR="${MIRROR:-${UBUNTU_PORTS_MIRROR:-}}"
+           distro_bootstrap "$ROOTFS" "$SUITE" "$ARCH" "$MIRROR" "$JOBS"
+           distro_configure "$ROOTFS" "$SUITE"
+           
+          PATCH_EOF
+          # 去掉为对齐 YAML 加上的 10 个前导空格。
+          # 只删精确的 10 空格前缀，因此补丁里新增行的 TAB 缩进保持原样，
+          # 空行也保持为空。
+          sed -i 's/^          //' /tmp/0002-kernel-cache.patch
+          patch -p1 --forward < /tmp/0002-kernel-cache.patch
+          bash -n build.sh
+          echo "build.sh 语法 OK"
+          grep -n 'dtbs FIRST\|kernel cache\|export MIRROR ARCH' build.sh
+
+      # build.sh 在这里会自己完整构建一次内核 + 约 1600 个模块（10-15 分钟），
+      # 因为跨 runner 的内核缓存不可复用（见上面「校验内核产物」的说明）。
+      # 好处是内核与模块一定同源同工具链，模块目录名必然与刷入的内核一致。
+      - name: 构建 rootfs（含内核重建，约 25-35 分钟）
         run: |
           set -euxo pipefail
           cd rootfs-builder
