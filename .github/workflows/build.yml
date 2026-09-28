@@ -284,6 +284,41 @@ jobs:
           echo "      可能需要重新生成（见 docs/BUILD.md §3.1）。"
 
       # ────────────────────────────────────────────── 5. 配置内核
+      # ────────────────────────────────────────────── 5b. 清理源码树
+      # 上游 MT6895-Mainline/linux 把内核构建产物也提交进了仓库
+      # （include/config、include/generated 等）。而 make 的 outputmakefile 规则
+      # 会据此判定"源码树不干净"，直接拒绝在 O=out 里构建：
+      #
+      #   UPD     .../kernel/out/Makefile
+      #   ***
+      #   *** The source tree is not clean, please run 'make ARCH=arm64 mrproper'
+      #   *** in .../kernel
+      #   ***
+      #   make[2]: *** [kernel/Makefile:709: outputmakefile] Error 1
+      #
+      # 注意 --filter=blob:none 解决不了这个问题：它只跳过 blob 内容的下载，
+      # tracked 文件照样会检出。
+      #
+      # 顺序很重要：mrproper 会把 .config 一起删掉，所以必须在写配置之前跑。
+      - name: 清理内核源码树
+        run: |
+          set -euxo pipefail
+          cd kernel
+          make ARCH=arm64 mrproper
+          # 兜底：清掉 mrproper 不处理、但仍会让 make 认为不干净的东西
+          # （-x 连 .gitignore 覆盖的文件一起清，-d 连目录，-f 强制）
+          git clean -xdf
+          echo
+          echo "清理后的状态："
+          git status --porcelain | head || true
+          for p in include/config include/generated .config; do
+            if [ -e "$p" ]; then
+              echo "::warning::$p 仍然存在，make 可能仍报 'not clean'"
+            else
+              echo "  ✅ $p 已清除"
+            fi
+          done
+
       - name: 写入内核配置
         run: |
           set -euxo pipefail
