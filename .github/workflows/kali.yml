@@ -1317,10 +1317,24 @@ jobs:
           done
 
           # 确认这确实是 Kali 而不是 Debian/Ubuntu
-          debugfs -R "cat /etc/os-release" /tmp/rootfs.raw 2>/dev/null \
-            | tee /tmp/os-release.txt
-          grep -qi '^ID=kali' /tmp/os-release.txt \
-            || { echo "::error::/etc/os-release 里没有 ID=kali，这个 rootfs 不是 Kali"; exit 1; }
+          #
+          # ⚠️ 不能读 /etc/os-release：在 Debian 12+ / Kali 里它是一个
+          # **符号链接** ../usr/lib/os-release（实测本镜像的 inode 255 就是），
+          # 而 debugfs 的 cat **不跟随符号链接** —— 它会把文件内容当块设备
+          # 去读，然后 "short read" 报错、什么都不输出。run 4 就是因此
+          # 误判成"这个 rootfs 不是 Kali"的，其实镜像完全正常。
+          # 所以直接读真实目标，并用锚定写法核对，避免 ID=kali-rolling 之类的
+          # 值被前缀匹配放过。
+          debugfs -R "cat /usr/lib/os-release" /tmp/rootfs.raw 2>/dev/null \
+            > /tmp/os-release.txt || true
+          if ! grep -qiE '^ID=kali[[:space:]]*$' /tmp/os-release.txt; then
+            echo "::error::/usr/lib/os-release 里没有 ID=kali，这个 rootfs 不是 Kali"
+            echo "--- 实际读到的内容（$(wc -c < /tmp/os-release.txt) 字节）---"
+            cat /tmp/os-release.txt
+            echo "--- /etc/os-release 的属性（确认它是不是符号链接）---"
+            debugfs -R "stat /etc/os-release" /tmp/rootfs.raw 2>/dev/null | head -6
+            exit 1
+          fi
           echo "✅ 确认是 Kali：$(grep '^PRETTY_NAME=' /tmp/os-release.txt)"
 
           # 默认用户（kali）与它的免密 sudo 规则
