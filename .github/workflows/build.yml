@@ -83,7 +83,21 @@ jobs:
     runs-on: ubuntu-26.04
     container:
       image: ubuntu:26.04      # 与本地验证环境一致的工具链
-      options: --user root
+      # --privileged 是**必需**的，不是图省事：
+      #
+      # mmdebstrap 的 root/sudo 模式（以 root 运行时 auto 会选它）手册明确写着
+      # "This mode needs to be able to mount and thus requires CAP_SYS_ADMIN"。
+      # GitHub 默认给容器的 capability 集不含 CAP_SYS_ADMIN，run 10 的报错正是它：
+      #   W: cannot mount because CAP_SYS_ADMIN is not in the effective set
+      #   W: cannot mount because CAP_SYS_ADMIN is not in the bounding set
+      #   unshare: unshare failed: Operation not permitted
+      #
+      # 同样地，在 x86-64 runner 上跑 arm64 的 apt/dpkg 需要向
+      # /proc/sys/fs/binfmt_misc 注册 qemu-aarch64 handler，而写入该目录
+      # 也需要 CAP_SYS_ADMIN —— 所以少了它，装 qemu-user-binfmt 也没用。
+      #
+      # 这个容器里跑的只是本仓库自己的构建脚本，不执行外部不可信输入。
+      options: --user root --privileged
     timeout-minutes: 180
 
     steps:
@@ -102,10 +116,69 @@ jobs:
             cpio gzip xz-utils zstd lz4 \
             python3 python3-pip \
             git rsync patch curl wget ca-certificates \
-            mmdebstrap qemu-user-binfmt \
+            mmdebstrap \
             kmod e2fsprogs util-linux \
             android-sdk-libsparse-utils \
-            mkbootimg
+            mkbootimg \
+            binfmt-support arch-test
+
+      # 在 x86-64 runner 上构建 arm64 rootfs，必须让内核能执行 arm64 二进制：
+      # qemu-user-binfmt 会为 qemu-aarch64 注册 binfmt_misc handler。
+      #
+      # 这一步单独成一节，是因为**注册需要 CAP_SYS_ADMIN**：没有它
+      # /proc/sys/fs/binfmt_misc 是空的，mmdebstrap 会一路走下坡：
+      #   W: cannot mount because CAP_SYS_ADMIN is not in the effective set
+      #   unshare: unshare failed: Operation not permitted
+      #   E: install arch-test for foreign architecture support
+      # （run 10 就是死在这里。）所以容器必须带 --privileged，见 jobs.<job>.container。
+      - name: 检查 arm64 二进制能否执行（qemu binfmt）
+        run: |
+          set -euxo pipefail
+          echo "=== binfmt_misc 状态 ==="
+          if [ -d /proc/sys/fs/binfmt_misc ]; then
+            ls /proc/sys/fs/binfmt_misc/ | head -20
+          else
+            echo "  /proc/sys/fs/binfmt_misc 不存在"
+          fi
+
+          if [ ! -e /proc/sys/fs/binfmt_misc/qemu-aarch64 ]; then
+            echo "::warning::qemu-aarch64 未注册，尝试注册"
+            # 优先用包自带的机制
+            if command -v update-binfmts >/dev/null 2>&1; then
+              update-binfmts --enable qemu-aarch64 2>/dev/null || true
+            fi
+            # 兜底：手工注册。arm64 ELF 的 magic/mask 与 qemu-aarch64 一致，
+            # 解释器路径在 Ubuntu 26.04 上是 /usr/bin/qemu-aarch64。
+            if [ ! -e /proc/sys/fs/binfmt_misc/qemu-aarch64 ]; then
+              QEMU=$(command -v qemu-aarch64 || true)
+              if [ -n "$QEMU" ] && [ -w /proc/sys/fs/binfmt_misc/register ]; then
+                echo "手工注册：$QEMU"
+                # F 标志 = 解释器路径固定（不随 chroot 改变），这是跨 chroot 必须的
+                echo ":qemu-aarch64:M::\\x7f\\x45\\x4c\\x46\\x02\\x01\\x01\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x02\\x00\\xb7\\x00::${QEMU}:F" \
+                  > /proc/sys/fs/binfmt_misc/register 2>/dev/null || true
+              fi
+            fi
+            if [ ! -e /proc/sys/fs/binfmt_misc/qemu-aarch64 ]; then
+              echo "::error::无法注册 qemu-aarch64 binfmt handler —— 容器缺少 CAP_SYS_ADMIN？"
+              echo "需要 container.options 里有 --privileged（见 build.yml 的 jobs.build.container）"
+              exit 1
+            fi
+          fi
+          echo "qemu-aarch64 handler:"
+          cat /proc/sys/fs/binfmt_misc/qemu-aarch64
+
+          # 用 arch-test 真跑一个 arm64 二进制（比自造的 ELF 头可靠：
+          # 一个只有 ELF 头、没有合法节表的文件会被 qemu 拒绝，不能作为判据）。
+          # mmdebstrap 自己也是靠它判断能否构建外架构 rootfs ——
+          # run 10 报错里的 "install arch-test for foreign architecture support"
+          # 就是它在提示这个检查失败了。
+          if arch-test arm64; then
+            echo "✅ arm64 可执行（qemu binfmt 生效）"
+          else
+            echo "::error::arm64 无法执行，mmdebstrap 处理不了 arm64 的 apt/dpkg"
+            echo "需要 container.options 含 --privileged（见 jobs.build.container）"
+            exit 1
+          fi
 
       - name: 检查工具链版本
         run: |

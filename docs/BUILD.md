@@ -1101,12 +1101,50 @@ sudo docker run --rm hello-world
 ## 8. 自动化构建（GitHub Actions）
 
 > **本节只是原理示意。** 真正的、可直接用的 workflow 是仓库里的
-> [`.github/workflows/build.yml`](../.github/workflows/build.yml)——它有 23 个 step，
+> [`.github/workflows/build.yml`](../.github/workflows/build.yml)——它有 31 个 step，
 > 包含手动触发输入、设备 profile 与 Ubuntu 后端的现场生成、`build.sh` 补丁等。
 > 下面的片段为了讲清原理做了删减，**不要直接复制去用**。
 >
 > 另外：它**不使用任何 secret**。厂商固件直接提交在 `firmware/` 里
 > （见 [`SOURCES.md`](SOURCES.md#5-firmware)），仓库因此建议设为 private。
+
+### 8.0 容器必须加 `--privileged`（否则 mmdebstrap 必失败）
+
+这不是"图方便"，是两个硬性要求叠加的结果：
+
+**① `mmdebstrap` 的 root 模式需要 `CAP_SYS_ADMIN`。** 手册原文：
+
+> `sudo, root` —— This mode directly executes chroot … **This mode needs to be
+> able to mount and thus requires "CAP_SYS_ADMIN".**
+
+以 root 运行时 `--mode=auto` 就会选它。GitHub 默认给容器的 capability 集不含
+`CAP_SYS_ADMIN`，实测报错（run 10）：
+
+```
+W: cannot mount because CAP_SYS_ADMIN is not in the effective set
+W: cannot mount because CAP_SYS_ADMIN is not in the bounding set
+unshare: unshare failed: Operation not permitted
+E: install arch-test for foreign architecture support
+```
+
+**② 在 x86-64 runner 上构建 arm64 rootfs 需要 qemu binfmt。**
+向 `/proc/sys/fs/binfmt_misc/register` 写入 handler **同样需要
+`CAP_SYS_ADMIN`** —— 所以没有 `--privileged` 时，装 `qemu-user-binfmt` 也不起作用，
+binfmt_misc 目录会是空的。
+
+```yaml
+container:
+  image: ubuntu:26.04
+  options: --user root --privileged
+```
+
+workflow 里有一节「检查 arm64 二进制能否执行（qemu binfmt）」，用 `arch-test arm64`
+真跑一个 arm64 二进制来确认；必要时会手工注册 handler（magic/mask 已与本机
+`/proc/sys/fs/binfmt_misc/qemu-aarch64` 的实际值逐字节核对）。
+
+> 不要试图用 `--mode=chrootless` 绕过：手册明确警告它会在**宿主机上直接执行
+> maintainer scripts**（对不支持 `DPKG_ROOT` 的包会改坏宿主机），并建议只在
+> 一次性 chroot 里使用。
 
 **能自动化**：内核编译、配置生成、rootfs 构建、boot.img 打包、产物校验。
 
