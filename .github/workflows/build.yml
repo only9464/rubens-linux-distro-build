@@ -1218,6 +1218,29 @@ jobs:
           done
           echo "rootfs 校验通过"
 
+      # ─────────────────────────────────────────────────────────────────
+      # 产物上传（1/2）：内核 + rootfs
+      #
+      # `if: ${{ !cancelled() }}` 是刻意的 —— rootfs 一旦构建出来就是有价值的成果，
+      # 后面任何一步（打 boot.img、算校验和、存缓存…）失败都不该把它丢掉，
+      # 否则又要重跑十几分钟。所以它紧跟在 rootfs 构建成功之后。
+      #
+      # upload-artifact 对匹配不到的文件默认只 `warn` 不失败，所以
+      # 这份列表里即使少了某些项也不会让 job 变红。
+      # ─────────────────────────────────────────────────────────────────
+      - name: 上传产物（内核 + rootfs，无论后续成败）
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: rubens-ubuntu-2604-kernel-rootfs-${{ github.run_number }}
+          path: |
+            rootfs-builder/out/Image-rubens-ubuntu
+            rootfs-builder/out/dtb-rubens-ubuntu.dtb
+            rootfs-builder/out/KERNEL-INFO-rubens-ubuntu.txt
+            rootfs-builder/out/rootfs-rubens-ubuntu-*-sparse.img
+            rootfs-builder/out/rootfs-rubens-ubuntu-*-sparse.img.gz
+          retention-days: 30
+
       # ────────────────────────────────────────────── 10. 打包启动镜像
       - name: 打包 boot.img
         run: |
@@ -1261,47 +1284,27 @@ jobs:
             sha256sum "$IMG"
           } | tee SHA256SUMS
 
-      # upload-artifact 对匹配不到的文件默认只是 `warn`，会静默漏传。
-      # 这里在传入前逐个 glob 检查，缺哪个就明确报哪个并失败，
-      # 免得拿到一个"看起来成功但少了 boot.img"的 artifact。
-      - name: 上传前确认产物齐全
-        run: |
-          set -euxo pipefail
-          MISSING=0
-          checkglob() {
-            local pat="$1" label="$2" n=0 f
-            # 逐个匹配并计数（glob 不匹配时保持字面量，用 -e 判断即可）
-            for f in $pat; do
-              [ -e "$f" ] && n=$((n + 1))
-            done
-            if [ "$n" -gt 0 ]; then
-              printf '  ✅ %-58s %s 个\n' "$label" "$n"
-            else
-              printf '  ❌ %-58s 无匹配: %s\n' "$label" "$pat"
-              MISSING=1
-            fi
-          }
-          checkglob "$KERNEL_DIR/arch/arm64/boot/Image"                     "内核 Image"
-          checkglob "$KERNEL_DIR/arch/arm64/boot/dts/mediatek/mt6895-xiaomi-rubens.dtb" "设备树 DTB"
-          checkglob "$KERNEL_DIR/.config"                                   "内核配置"
-          checkglob "boot-ubuntu.img"                                       "boot.img"
-          checkglob "rootfs-builder/out/rootfs-rubens-ubuntu-*-sparse.img"  "rootfs 稀疏镜像"
-          checkglob "rootfs-builder/out/KERNEL-INFO-rubens-ubuntu.txt"      "内核信息"
-          checkglob "SHA256SUMS"                                            "校验和"
-          [ "$MISSING" = 0 ] || { echo "::error::有产物缺失，artifact 会不完整"; exit 1; }
-          echo "产物齐全，可以上传"
-
-      - name: 上传产物
+      # ─────────────────────────────────────────────────────────────────
+      # 产物上传（2/2）：boot.img
+      #
+      # 同样 `if: ${{ !cancelled() }}`：打包成功之后若「生成校验和」之类再失败，
+      # 也不该把 boot.img 丢掉。
+      #
+      # `if-no-files-found: ignore` 是因为这一步在打包失败时也会执行 ——
+      # 那时文件不存在属于预期，不该让 job 因为"找不到要上传的东西"再红一次。
+      # （v4 的默认值就是 warn，这里写出来是为了表明是刻意的。）
+      #
+      # 找不到文件时它不会失败，但用户就看不到产物了；所以「打包 boot.img」
+      # 本身失败会在上一步直接报错，不会静默。
+      # ─────────────────────────────────────────────────────────────────
+      - name: 上传产物（boot.img + 校验和，无论后续成败）
+        if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4
         with:
-          name: rubens-ubuntu-2604-${{ github.run_number }}
+          name: rubens-ubuntu-2604-boot-${{ github.run_number }}
+          if-no-files-found: ignore
           path: |
-            kernel-cache/arch/arm64/boot/Image
-            kernel-cache/arch/arm64/boot/dts/mediatek/mt6895-xiaomi-rubens.dtb
-            kernel-cache/.config
             boot-ubuntu.img
-            rootfs-builder/out/rootfs-rubens-ubuntu-*-sparse.img
-            rootfs-builder/out/KERNEL-INFO-rubens-ubuntu.txt
             SHA256SUMS
           retention-days: 30
 
