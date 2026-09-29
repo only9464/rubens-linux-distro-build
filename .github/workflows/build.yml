@@ -103,6 +103,7 @@ jobs:
             python3 python3-pip \
             git rsync patch curl wget ca-certificates \
             mmdebstrap qemu-user-binfmt \
+            kmod e2fsprogs util-linux \
             android-sdk-libsparse-utils \
             mkbootimg
 
@@ -147,6 +148,41 @@ jobs:
           done
           mkbootimg --help >/dev/null 2>&1 && echo "  mkbootimg 可正常执行"
           [ "$fail" = 0 ] || exit 1
+
+      # 预检 build.sh 要求的**全部**宿主工具。
+      #
+      # 这条单独成步是有代价换来的：run 8 在 rootfs 阶段死在
+      #   error: missing host tool: depmod
+      # 而那时内核已经编了 77 分钟。容器是精简的 ubuntu:26.04，
+      # 这些工具不会"顺便"带上，必须显式安装 + 显式检查。
+      #
+      # 清单与 rootfs/build.sh 里那一行保持一致：
+      #   for tool in mmdebstrap mkfs.ext4 zstd du findmnt depmod
+      # 另加 build.sh 实际会调用、但不在该循环里的 img2simg / llvm-strip。
+      - name: 预检 rootfs 构建所需的宿主工具
+        run: |
+          set -euxo pipefail
+          fail=0
+          check() {
+            if command -v "$1" >/dev/null 2>&1; then
+              printf '  ✅ %-12s %s\n' "$1" "$(command -v "$1")"
+            else
+              printf '  ❌ %-12s 缺失（包: %s）\n' "$1" "$2"
+              fail=1
+            fi
+          }
+          echo "build.sh 的 requires 列表："
+          check mmdebstrap  mmdebstrap
+          check mkfs.ext4   e2fsprogs
+          check zstd        zstd
+          check du          coreutils
+          check findmnt     util-linux
+          check depmod      kmod
+          echo "build.sh 会调用但不在 requires 列表里的："
+          check img2simg    android-sdk-libsparse-utils
+          check llvm-strip  llvm
+          [ "$fail" = 0 ] || { echo "::error::容器缺少 rootfs 构建所需的宿主工具"; exit 1; }
+          echo "✅ 宿主工具齐备"
 
       # ────────────────────────────────────────────── 2. 解析内核来源
       # 优先级规则（对应 workflow_dispatch 的三个输入框）：
@@ -195,7 +231,6 @@ jobs:
 
       # ────────────────────────────────────────────── 3. 克隆内核
       - name: 克隆内核源码
-        if: env.SKIP_KERNEL_BUILD != '1'
         run: |
           set -euxo pipefail
           REPO="${{ steps.src.outputs.repo }}"
@@ -278,7 +313,7 @@ jobs:
         id: kcache
         uses: actions/cache/restore@v4
         with:
-          path: kernel
+          path: kernel-cache
           key: >-
             kernel-${{ env.CACHE_VERSION }}-${{
               inputs.force_kernel_rebuild == true && 'nocache' ||
@@ -292,13 +327,14 @@ jobs:
             HIT="false"
             echo "指定了 force_kernel_rebuild，忽略缓存"
           fi
-          if [ "$HIT" = "true" ] && [ -f kernel/arch/arm64/boot/Image ] \
-             && [ -f kernel/Module.symvers ] && [ -f kernel/.config ]; then
+          if [ "$HIT" = "true" ] && [ -f kernel-cache/arch/arm64/boot/Image ] \
+             && [ -f kernel-cache/Module.symvers ] && [ -f kernel-cache/.config ] \
+             && [ -f kernel-cache/include/config/kernel.release ]; then
             echo "SKIP_KERNEL_BUILD=1" >> "$GITHUB_ENV"
             echo "✅ 内核缓存命中 —— 跳过编译（省下约 77 分钟）"
-            echo "   Image : $(stat -c %s kernel/arch/arm64/boot/Image) 字节"
-            echo "   模块  : $(find kernel -name '*.ko' | wc -l) 个"
-            echo "   版本  : $(cat kernel/include/config/kernel.release 2>/dev/null || echo 未知)"
+            echo "   Image : $(stat -c %s kernel-cache/arch/arm64/boot/Image) 字节"
+            echo "   模块  : $(find kernel-cache -name '*.ko' | wc -l) 个"
+            echo "   版本  : $(cat kernel-cache/include/config/kernel.release)"
           else
             echo "SKIP_KERNEL_BUILD=0" >> "$GITHUB_ENV"
             if [ "$HIT" = "true" ]; then
@@ -307,6 +343,11 @@ jobs:
               echo "未命中内核缓存 —— 本次会完整编译（约 77 分钟）"
             fi
           fi
+          # build.sh 需要一个**带 .git 的内核仓库**来铺源码（缓存命中时会跑
+          # `git -C "$KERNEL_REPO" archive`）。kernel/ 因此始终是全新克隆，
+          # 不依赖缓存里是否保住了嵌套的 .git —— 那是 actions/cache 的常见坑。
+          [ -d kernel/.git ] || { echo "::error::kernel/ 不是 git 仓库"; exit 1; }
+          echo "内核源码仓库 kernel/ 就绪（含 .git）"
 
       - name: 应用移植补丁
         if: env.SKIP_KERNEL_BUILD != '1'
@@ -453,9 +494,44 @@ jobs:
           LOCALVERSION= make -C . ARCH=arm64 LLVM=1 \
             -j"$(nproc)" Image modules 2>&1 | tail -30
 
+      # 统一「这次用哪棵树」：命中缓存就是 kernel-cache/，否则是刚编好的 kernel/。
+      # 后面所有步骤（校验、build.sh、boot.img、校验和、摘要）都只认 $KERNEL_DIR，
+      # 这样两条路径不会各写一套常量而慢慢走偏。
+      - name: 确定本次使用的内核树
+        run: |
+          set -euxo pipefail
+          if [ "${SKIP_KERNEL_BUILD:-0}" = "1" ]; then
+            DIR=kernel-cache
+          else
+            DIR=kernel
+          fi
+          for f in arch/arm64/boot/Image .config Module.symvers \
+                   include/config/kernel.release; do
+            [ -f "$DIR/$f" ] || { echo "::error::$DIR 缺 $f"; exit 1; }
+          done
+          N=$(find "$DIR" -name '*.ko' | wc -l)
+          [ "$N" -gt 1500 ] || { echo "::error::$DIR 只有 $N 个 .ko"; exit 1; }
+          echo "KERNEL_DIR=$DIR" >> "$GITHUB_ENV"
+          echo "本次内核树: $DIR（$N 个 .ko，$(du -sh "$DIR" | cut -f1)）"
+
       # ────────────────────────────────────────────── 8. 门禁校验
       - name: 校验内核（体积 / 版本 / 配置 / DTB）
-        run: ./scripts/verify-kernel.sh kernel
+        run: ./scripts/verify-kernel.sh "$KERNEL_DIR"
+
+      # 未命中缓存时，把刚编好的 kernel/ 复制成 kernel-cache/，
+      # 于是**两条路径之后完全一致**，且这份就是最后要存进 actions/cache 的东西。
+      # 命中时它已经存在，什么都不用做。
+      - name: 未命中缓存时建立 kernel-cache
+        if: env.SKIP_KERNEL_BUILD != '1'
+        run: |
+          set -euxo pipefail
+          rm -rf kernel-cache
+          NEED_KB=$(du -sk kernel | cut -f1)
+          AVAIL_KB=$(df -Pk . | awk 'NR==2 {print $4}')
+          echo "需要 $((NEED_KB/1024)) MB / 可用 $((AVAIL_KB/1024)) MB"
+          [ "$AVAIL_KB" -ge "$NEED_KB" ] || { echo "::error::空间不足"; df -h .; exit 1; }
+          cp -a kernel kernel-cache
+          echo "已建立 kernel-cache（$(du -sh kernel-cache | cut -f1)）"
 
       # ────────────────────────────────────────────── 9. 构建系统镜像
       - name: 克隆 rootfs 构建器
@@ -478,19 +554,19 @@ jobs:
           mkdir -p rootfs-builder/out
           rm -rf rootfs-builder/out/kernel-cache
 
-          # 缓存是整棵构建树的副本，所以要两份空间才够。
-          # 先检查剩余空间，免得 cp 到一半才失败（那时日志很难看出原因）。
-          NEED_KB=$(du -sk kernel | cut -f1)
+          # 直接用 $KERNEL_DIR：它已经是「缓存未命中=kernel/ / 命中=kernel-cache/」，
+          # 两条路都保证是 $KBOUT 形状（真内核 Makefile），无需再区分。
+          NEED_KB=$(du -sk "$KERNEL_DIR" | cut -f1)
           AVAIL_KB=$(df -Pk . | awk 'NR==2 {print $4}')
-          echo "需要 : $((NEED_KB/1024)) MB"
-          echo "可用 : $((AVAIL_KB/1024)) MB"
+          echo "来源 : $KERNEL_DIR"
+          echo "需要 : $((NEED_KB/1024)) MB / 可用 $((AVAIL_KB/1024)) MB"
           if [ "$AVAIL_KB" -lt "$NEED_KB" ]; then
-            echo "::error::磁盘空间不足，无法复制内核缓存（需 $((NEED_KB/1024)) MB，可用 $((AVAIL_KB/1024)) MB）"
+            echo "::error::磁盘空间不足（需 $((NEED_KB/1024)) MB，可用 $((AVAIL_KB/1024)) MB）"
             df -h .
             exit 1
           fi
 
-          cp -a kernel rootfs-builder/out/kernel-cache
+          cp -a "$KERNEL_DIR" rootfs-builder/out/kernel-cache
 
           CACHE=rootfs-builder/out/kernel-cache
           for f in arch/arm64/boot/Image .config Module.symvers \
@@ -524,24 +600,6 @@ jobs:
           echo "模块         : $(find "$CACHE" -name '*.ko' | wc -l) 个"
           echo "大小         : $(du -sh "$CACHE" | cut -f1)"
           echo "REL=$REL" >> "$GITHUB_ENV"
-
-      - name: 精简内核树（删 .o，为缓存瘦身）
-        if: env.SKIP_KERNEL_BUILD != '1'
-        run: |
-          set -euxo pipefail
-          BEFORE=$(du -sm kernel | cut -f1)
-          find kernel -name '*.o' -delete
-          find kernel -name '.*.o.cmd' -delete
-          AFTER=$(du -sm kernel | cut -f1)
-          echo "删掉 .o：${BEFORE} MB -> ${AFTER} MB"
-          # 自检：缓存内容一个都不能少
-          for f in arch/arm64/boot/Image .config Module.symvers \
-                   include/config/kernel.release modules.order .git; do
-            [ -e "kernel/$f" ] || { echo "::error::缓存内容缺 $f"; exit 1; }
-          done
-          N=$(find kernel -name '*.ko' | wc -l)
-          [ "$N" -gt 1500 ] || { echo "::error::模块数异常: $N"; exit 1; }
-          echo "缓存内容自检通过（$N 个 .ko）"
 
       # 上游 MT6895-Mainline/rootfs 的 devices/ 里只有
       #   pearl.conf  qqcandy.conf  rubens.conf  xaga.conf
@@ -1004,9 +1062,11 @@ jobs:
           grep -n 'dtbs FIRST\|kernel cache\|export MIRROR ARCH' build.sh
 
       # build.sh 会命中上面做好的内核缓存（打印 "reusing the cached kernel build"
-      # 和 "kernel model: SKIPPED"），所以这里**不再重编内核**，只剩 userspace 工作。
-      # 缓存未命中时它会自己 in-tree 编一遍（$KBOUT 是 git archive 出的干净树）。
-      - name: 构建 rootfs（缓存命中，约 10-15 分钟）
+      # 与 "kernel image: SKIPPED"），所以这里**不重编内核**，只剩 userspace 工作。
+      # --kernel-repo 指向 kernel/（**一定是带 .git 的全新克隆**），因为缓存命中时
+      # build.sh 要跑 `git -C "$KERNEL_REPO" archive` 把源码铺回 $KBOUT；
+      # 而 --kernel-config 取 $KERNEL_DIR 的，保证与模块同源。
+      - name: 构建 rootfs（缓存命中时不重编内核）
         run: |
           set -euxo pipefail
           cd rootfs-builder
@@ -1015,7 +1075,7 @@ jobs:
             --distro        ubuntu \
             --suite         resolute \
             --kernel-repo   "$PWD/../kernel" \
-            --kernel-config "$PWD/../kernel/.config" \
+            --kernel-config "$PWD/../$KERNEL_DIR/.config" \
             --firmware      "$PWD/../firmware" \
             --jobs          "$(nproc)" \
             --hostname      rubens \
@@ -1055,7 +1115,7 @@ jobs:
           set -euxo pipefail
           chmod +x scripts/*.sh
           ./scripts/make-bootimg.sh \
-            --kernel  kernel/arch/arm64/boot/Image \
+            --kernel  "$KERNEL_DIR/arch/arm64/boot/Image" \
             --ramdisk ramdisk-proven.lz4 \
             --firmware firmware \
             --out     boot-ubuntu.img
@@ -1071,8 +1131,8 @@ jobs:
             echo "# commit:   ${{ steps.src.outputs.commit }}"
             echo "# 工作流:   ${{ github.sha }}"
             echo
-            sha256sum kernel/arch/arm64/boot/Image
-            sha256sum kernel/arch/arm64/boot/dts/mediatek/mt6895-xiaomi-rubens.dtb
+            sha256sum "$KERNEL_DIR/arch/arm64/boot/Image"
+            sha256sum "$KERNEL_DIR/arch/arm64/boot/dts/mediatek/mt6895-xiaomi-rubens.dtb"
             sha256sum boot-ubuntu.img
             sha256sum "$IMG"
           } | tee SHA256SUMS
@@ -1082,9 +1142,9 @@ jobs:
         with:
           name: rubens-ubuntu-2604-${{ github.run_number }}
           path: |
-            kernel/arch/arm64/boot/Image
-            kernel/arch/arm64/boot/dts/mediatek/mt6895-xiaomi-rubens.dtb
-            kernel/.config
+            kernel-cache/arch/arm64/boot/Image
+            kernel-cache/arch/arm64/boot/dts/mediatek/mt6895-xiaomi-rubens.dtb
+            kernel-cache/.config
             boot-ubuntu.img
             rootfs-builder/out/rootfs-rubens-ubuntu-*-sparse.img
             rootfs-builder/out/KERNEL-INFO-rubens-ubuntu.txt
@@ -1092,24 +1152,40 @@ jobs:
           retention-days: 30
 
       # ────────────────────────────────────────────── 12. 精简内核树（为缓存瘦身）
-      # 为下一步的缓存瘦身：实测 modules_install **一个 .o 都不需要**
-      # （它只读 modules.order 与 .ko）。删掉后树从 9.9 GB 降到 4.6 GB。
+      # 实测 modules_install **一个 .o 都不需要**（它只读 modules.order 与 .ko；
+      # scripts/Makefile.modinst:122 的规则是 `$(dst)/%.ko: %.ko FORCE`，
+      # 前置是 .ko 而不是 .o）。删掉 .o 后树从 9.9 GB 降到 4.6 GB，压缩后约 1 GB。
+      #
+      # 删的是 kernel-cache/（要存的那份），不是 kernel/：
+      # 此时 rootfs 已经构建完，kernel/ 只是源码树，留着不影响。
       # .git 必须保留 —— build.sh 要在 KERNEL_REPO 里跑 git archive 铺源码。
+      - name: 精简内核缓存（删 .o）
+        if: env.SKIP_KERNEL_BUILD != '1'
+        run: |
+          set -euxo pipefail
+          BEFORE=$(du -sm kernel-cache | cut -f1)
+          find kernel-cache -name '*.o' -delete
+          find kernel-cache -name '.*.o.cmd' -delete
+          AFTER=$(du -sm kernel-cache | cut -f1)
+          echo "删掉 .o：${BEFORE} MB -> ${AFTER} MB"
+          for f in arch/arm64/boot/Image .config Module.symvers \
+                   include/config/kernel.release modules.order .git; do
+            [ -e "kernel-cache/$f" ] || { echo "::error::缓存内容缺 $f"; exit 1; }
+          done
+          N=$(find kernel-cache -name '*.ko' | wc -l)
+          [ "$N" -gt 1500 ] || { echo "::error::模块数异常: $N"; exit 1; }
+          echo "缓存内容自检通过（$N 个 .ko）"
 
       # ────────────────────────────────────────────── 12b. 保存内核缓存（跨 run 复用）
       #
       # 「在新开的一次 action 里直接跳过内核编译」靠这一步。缓存键含内核来源、
       # 内核配置与补丁的指纹，所以它们一变就会自动重建，不会用错缓存。
-      #
       # 放在流程最末尾：只有前面的构建都成功了才值得把产物存起来。
-      # 上面「精简内核树」已删掉 .o（modules_install 不需要它们），
-      # 树从 9.9 GB 降到 4.6 GB，压缩后约 1 GB。.git 必须保留，
-      # 因为 build.sh 要在 KERNEL_REPO 里跑 git archive 铺源码。
       - name: 保存内核缓存
         if: env.SKIP_KERNEL_BUILD != '1'
         uses: actions/cache/save@v4
         with:
-          path: kernel
+          path: kernel-cache
           key: >-
             kernel-${{ env.CACHE_VERSION }}-${{
               format('{0}-{1}', steps.src.outputs.commit, hashFiles('configs/kernel.config', 'configs/mt6895-fixups.config', 'patches/0001-rubens-port-fixes.patch'))
@@ -1118,4 +1194,4 @@ jobs:
 
       - name: 写入构建摘要
         if: always()
-        run: ./scripts/ci-summary.sh kernel >> "$GITHUB_STEP_SUMMARY"
+        run: ./scripts/ci-summary.sh "$KERNEL_DIR" >> "$GITHUB_STEP_SUMMARY"
