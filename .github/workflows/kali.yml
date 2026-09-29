@@ -788,13 +788,19 @@ jobs:
           PACKAGES_CORE="kali-archive-keyring systemd systemd-sysv \
                          systemd-resolved systemd-timesyncd openssh-server sudo kmod"
 
-          # 只做 CLI 可用性：**刻意不装任何 kali-linux-* 元包**，
-          # 所以这一档镜像很小（约 200 MB 级），最容易先确认能开机、能联网。
-          # 想要工具集/桌面见文件末尾的说明。
+          # 保持最小：**不装 kali-linux-headless / kali-linux-default 这类大元包**
+          # （它们会拉进 metasploit、hashcat 等几百个工具，镜像涨到 3-12 GB），
+          # 所以这一档镜像很小（实测 gzip 后 95 MiB），最容易先确认能开机、能联网。
+          #
+          # 但 kali-linux-core 要装：它是 Kali 的**最小**元包
+          # （只有 kali-system-core / netcat-traditional / tcpdump 三个依赖），
+          # 补上 Kali 自己的基础配置与 /etc/skel，否则这个系统虽然包都来自
+          # Kali 归档，用起来却不像 Kali。想要全套工具见下面两个开关。
           #
           # wpasupplicant 必须有 —— 缺了它 NetworkManager 完全没有无线能力，
           # wlan0 会永远是 unavailable。
-          PACKAGES_EXTRA="network-manager bluez modemmanager iio-sensor-proxy \
+          PACKAGES_EXTRA="kali-linux-core network-manager bluez modemmanager \
+                          iio-sensor-proxy \
                           alsa-ucm-conf alsa-utils usbutils pciutils iproute2 \
                           ethtool iw rfkill wireless-regdb wpasupplicant \
                           kali-defaults \
@@ -1050,16 +1056,29 @@ jobs:
           	# ---------------------------------------------------------- extra pkgs
           	# 逐个安装设备支持包：某个包在 Kali 里不存在时，不至于让整个
           	# bootstrap 失败，每一次缺失都会被报告。
+          	#
+          	# 但"装不上"有两种完全不同的原因，必须分开报：
+          	#   * 包真的不在这个 suite 里             → SKIPPED，正常，继续
+          	#   * 网络/镜像临时抽风（apt-get update 失败）→ 后面每个包都会"装不上"，
+          	#     而那不代表包不存在。run 3 里 TUNA 有一次 DNS 解析失败，
+          	#     却报了 26 次 "not installable" —— 会把排查方向带偏。
+          	# 所以先单独判定 apt 索引是否可用。
           	local pkgs
           	pkgs="$(printf '%s %s' "${PACKAGES_EXTRA:-}" | tr -s ' ' | sed 's/^ //; s/ $//')"
           	if [ -n "$pkgs" ]; then
-          		chroot "$rootfs" /bin/sh -c 'apt-get update -qq' || \
-          			echo "warning: apt-get update failed" >&2
+          		local apt_ok=1
+          		if ! chroot "$rootfs" /bin/sh -c 'apt-get update -qq' 2>/dev/null; then
+          			apt_ok=0
+          			echo "::warning::chroot 里 apt-get update 失败（多半是镜像临时不可用）；" \
+          			     "下面每个包的安装结果都不可信" >&2
+          		fi
           		for p in $pkgs; do
           			if chroot "$rootfs" /bin/sh -c \
           				"DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends $p" \
           				>/dev/null 2>&1; then
           				echo "  installed: $p"
+          			elif [ "$apt_ok" = "0" ]; then
+          				echo "  UNKNOWN (apt 索引不可用，无法判断 $p 是否存在): $p" >&2
           			else
           				echo "  SKIPPED (not installable in $suite): $p" >&2
           			fi
@@ -1263,7 +1282,12 @@ jobs:
         run: |
           set -euxo pipefail
           cd rootfs-builder
-          IMG=$(ls -t out/rootfs-rubens-kali-rolling-*-sparse.img | head -1)
+          # 文件名里的 "rubens-kali" 是 **DEVICE**（--device rubens-kali），
+          # 不是 suite：build.sh 的 $DISTRO_NAME 是 `basename --distro kali`
+          # = `kali`，所以它不会出现在产物名里。
+          # run 3 就是按 "rootfs-rubens-kali-rolling-*" 去 glob 的，
+          # 结果一个文件都匹配不到（rootfs 其实已经建好了）。
+          IMG=$(ls -t out/rootfs-rubens-kali-*-sparse.img | head -1)
           echo "镜像: $IMG ($(stat -c %s "$IMG") 字节)"
           # 写进 GITHUB_ENV 的必须是**绝对路径**：后面「生成校验和」在仓库根目录跑，
           # 而这里的 $IMG 是相对 rootfs-builder/ 的。
@@ -1324,8 +1348,8 @@ jobs:
             rootfs-builder/out/Image-rubens-kali
             rootfs-builder/out/dtb-rubens-kali.dtb
             rootfs-builder/out/KERNEL-INFO-rubens-kali.txt
-            rootfs-builder/out/rootfs-rubens-kali-rolling-*-sparse.img
-            rootfs-builder/out/rootfs-rubens-kali-rolling-*-sparse.img.gz
+            rootfs-builder/out/rootfs-rubens-kali-*-sparse.img
+            rootfs-builder/out/rootfs-rubens-kali-*-sparse.img.gz
           retention-days: 30
 
       # ────────────────────────────────────────────── 7. 打包启动镜像
