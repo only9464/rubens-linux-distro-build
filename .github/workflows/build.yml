@@ -1193,7 +1193,10 @@ jobs:
           cd rootfs-builder
           IMG=$(ls -t out/rootfs-rubens-ubuntu-*-sparse.img | head -1)
           echo "镜像: $IMG ($(stat -c %s "$IMG") 字节)"
-          echo "IMG=$IMG" >> "$GITHUB_ENV"
+          # 写进 GITHUB_ENV 的必须是**绝对路径**：后面「生成校验和」在仓库根目录跑，
+          # 而这里的 $IMG 是相对 rootfs-builder/ 的。run 13 正是死在这一点：
+          #   sha256sum: out/rootfs-...-sparse.img: No such file or directory
+          echo "IMG=${GITHUB_WORKSPACE}/rootfs-builder/${IMG}" >> "$GITHUB_ENV"
           simg2img "$IMG" /tmp/rootfs.raw
 
           LABEL=$(dd if=/tmp/rootfs.raw bs=1 skip=$((1024+120)) count=16 2>/dev/null | tr -d '\0')
@@ -1230,6 +1233,21 @@ jobs:
       - name: 生成校验和
         run: |
           set -euxo pipefail
+          # 先确认每个要算的文件都在，缺哪个就明确报哪个 —— 否则只会看到
+          # 一行 "sha256sum: <path>: No such file or directory"（run 13 就是）。
+          MISSING=0
+          for f in "$KERNEL_DIR/arch/arm64/boot/Image" \
+                   "$KERNEL_DIR/arch/arm64/boot/dts/mediatek/mt6895-xiaomi-rubens.dtb" \
+                   boot-ubuntu.img "$IMG"; do
+            if [ -f "$f" ]; then
+              printf '  ✅ %-64s %s 字节\n' "$f" "$(stat -c %s "$f")"
+            else
+              printf '  ❌ %-64s 缺失\n' "$f"
+              MISSING=1
+            fi
+          done
+          [ "$MISSING" = 0 ] || { echo "::error::有产物缺失，无法生成校验和"; exit 1; }
+
           {
             echo "# rubens Ubuntu 26.04 构建产物"
             echo "# 内核来源: ${{ steps.src.outputs.repo }}"
@@ -1242,6 +1260,36 @@ jobs:
             sha256sum boot-ubuntu.img
             sha256sum "$IMG"
           } | tee SHA256SUMS
+
+      # upload-artifact 对匹配不到的文件默认只是 `warn`，会静默漏传。
+      # 这里在传入前逐个 glob 检查，缺哪个就明确报哪个并失败，
+      # 免得拿到一个"看起来成功但少了 boot.img"的 artifact。
+      - name: 上传前确认产物齐全
+        run: |
+          set -euxo pipefail
+          MISSING=0
+          checkglob() {
+            local pat="$1" label="$2" n=0 f
+            # 逐个匹配并计数（glob 不匹配时保持字面量，用 -e 判断即可）
+            for f in $pat; do
+              [ -e "$f" ] && n=$((n + 1))
+            done
+            if [ "$n" -gt 0 ]; then
+              printf '  ✅ %-58s %s 个\n' "$label" "$n"
+            else
+              printf '  ❌ %-58s 无匹配: %s\n' "$label" "$pat"
+              MISSING=1
+            fi
+          }
+          checkglob "$KERNEL_DIR/arch/arm64/boot/Image"                     "内核 Image"
+          checkglob "$KERNEL_DIR/arch/arm64/boot/dts/mediatek/mt6895-xiaomi-rubens.dtb" "设备树 DTB"
+          checkglob "$KERNEL_DIR/.config"                                   "内核配置"
+          checkglob "boot-ubuntu.img"                                       "boot.img"
+          checkglob "rootfs-builder/out/rootfs-rubens-ubuntu-*-sparse.img"  "rootfs 稀疏镜像"
+          checkglob "rootfs-builder/out/KERNEL-INFO-rubens-ubuntu.txt"      "内核信息"
+          checkglob "SHA256SUMS"                                            "校验和"
+          [ "$MISSING" = 0 ] || { echo "::error::有产物缺失，artifact 会不完整"; exit 1; }
+          echo "产物齐全，可以上传"
 
       - name: 上传产物
         uses: actions/upload-artifact@v4
