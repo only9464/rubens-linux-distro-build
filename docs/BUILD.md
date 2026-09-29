@@ -1146,6 +1146,40 @@ workflow 里有一节「检查 arm64 二进制能否执行（qemu binfmt）」�
 > maintainer scripts**（对不支持 `DPKG_ROOT` 的包会改坏宿主机），并建议只在
 > 一次性 chroot 里使用。
 
+### 8.0b qemu 的两个坑（都实际踩过）
+
+**坑 1：`qemu-user-binfmt` 只是个配置包，不含 qemu 二进制。**
+
+| 包 | 内容 |
+|---|---|
+| `qemu-user` | **`/usr/bin/qemu-aarch64`**（静态链接）+ `/usr/share/qemu/binfmt.d/*.conf` |
+| `qemu-user-binfmt` | 只有 `/usr/lib/binfmt.d/*.conf`，`Depends: qemu-user` |
+
+所以 apt 列表里要**显式写 `qemu-user`**。run 11 的失败与之相关：
+`command -v qemu-aarch64` 为空，注册的前提都不成立。
+
+**坑 2：注册串要用包自带的，不要自己拼。**
+
+Ubuntu 26.04（qemu 1:10.2.1）的官方值是：
+
+```
+:qemu-aarch64:M::\x7f\x45\x4c\x46…:\xff\xff\xff\xff…:/usr/bin/qemu-aarch64:OPF
+```
+
+标志位是 **`OPF`**，不是只有 `F`（我第一版手写时就漏了 `O` 和 `P`）。
+`O`=保留 argv[0]，`P`=保留原 argv，`F`=解释器路径固定（不随 chroot 改变；
+跨 chroot 执行 arm64 二进制必须有它）。
+
+> `update-binfmts` 是 binfmt-support 的旧工具，26.04 上不保证存在 —— 用它并加
+> `|| true` 会把失败**静默吞掉**，最后只得到"注册失败但不知为何"。
+> workflow 改为三条路依次尝试：`systemd-binfmt` → 把包里的 `.conf` 写进
+> `/proc/sys/fs/binfmt_misc/register` → 用内置的确切值兜底；失败时打印
+> qemu 路径、register 可写性、现有 handler 列表。
+
+**`binfmt_misc` 必须已挂载。** 容器里若没有该挂载，即使有 `CAP_SYS_ADMIN`
+也写不进去；workflow 会先尝试
+`mount -t binfmt_misc binfmt_misc /proc/sys/fs/binfmt_misc`。
+
 **能自动化**：内核编译、配置生成、rootfs 构建、boot.img 打包、产物校验。
 
 **不能自动化**：

@@ -120,7 +120,7 @@ jobs:
             kmod e2fsprogs util-linux \
             android-sdk-libsparse-utils \
             mkbootimg \
-            binfmt-support arch-test
+            qemu-user qemu-user-binfmt binfmt-support arch-test
 
       # 在 x86-64 runner 上构建 arm64 rootfs，必须让内核能执行 arm64 二进制：
       # qemu-user-binfmt 会为 qemu-aarch64 注册 binfmt_misc handler。
@@ -134,33 +134,62 @@ jobs:
       - name: 检查 arm64 二进制能否执行（qemu binfmt）
         run: |
           set -euxo pipefail
-          echo "=== binfmt_misc 状态 ==="
-          if [ -d /proc/sys/fs/binfmt_misc ]; then
-            ls /proc/sys/fs/binfmt_misc/ | head -20
-          else
-            echo "  /proc/sys/fs/binfmt_misc 不存在"
+          echo "=== 前置事实 ==="
+          echo "qemu-aarch64    : $(command -v qemu-aarch64 || echo '❌ 缺失（qemu-user 没装上）')"
+          echo "binfmt_misc 挂载: $(mount | grep -c binfmt_misc) 个"
+
+          # 没有 binfmt_misc 挂载时，register 自然不可写 —— 用 --privileged 拿到
+          # CAP_SYS_ADMIN 后可以自己挂上。
+          if ! grep -q 'binfmt_misc' /proc/mounts; then
+            echo "binfmt_misc 未挂载，尝试挂载"
+            mount -t binfmt_misc binfmt_misc /proc/sys/fs/binfmt_misc 2>&1 | sed 's/^/  /' || true
           fi
+          CAN_REG=no
+          [ -w /proc/sys/fs/binfmt_misc/register ] && CAN_REG=yes
+          echo "register 可写   : $CAN_REG"
+          echo "现有 handler    :"
+          ls /proc/sys/fs/binfmt_misc/ 2>/dev/null | head -20 | sed 's/^/  /'
 
           if [ ! -e /proc/sys/fs/binfmt_misc/qemu-aarch64 ]; then
             echo "::warning::qemu-aarch64 未注册，尝试注册"
-            # 优先用包自带的机制
-            if command -v update-binfmts >/dev/null 2>&1; then
-              update-binfmts --enable qemu-aarch64 2>/dev/null || true
+
+            # 注册串**直接用包自带的**，不要自己拼。qemu-user 提供
+            #   /usr/share/qemu/binfmt.d/qemu-aarch64.conf
+            # qemu-user-binfmt 把它装到 /usr/lib/binfmt.d/ 供 systemd-binfmt 读。
+            # 实测内容（Ubuntu 26.04 / qemu 1:10.2.1）：
+            #   :qemu-aarch64:M::<magic>:<mask>:/usr/bin/qemu-aarch64:OPF
+            # 标志是 OPF（O=保留 argv[0]，P=保留原 argv，F=解释器路径固定），
+            # 不是只有 F。
+            CONF=""
+            for c in /usr/lib/binfmt.d/qemu-aarch64.conf \
+                     /usr/share/qemu/binfmt.d/qemu-aarch64.conf; do
+              [ -f "$c" ] && CONF="$c" && break
+            done
+
+            # 途径 1：systemd-binfmt（容器里一般没有 systemd 在跑，多半无效）
+            if command -v systemd-binfmt >/dev/null 2>&1; then
+              systemd-binfmt --no-pager 2>/dev/null || true
             fi
-            # 兜底：手工注册。arm64 ELF 的 magic/mask 与 qemu-aarch64 一致，
-            # 解释器路径在 Ubuntu 26.04 上是 /usr/bin/qemu-aarch64。
-            if [ ! -e /proc/sys/fs/binfmt_misc/qemu-aarch64 ]; then
-              QEMU=$(command -v qemu-aarch64 || true)
-              if [ -n "$QEMU" ] && [ -w /proc/sys/fs/binfmt_misc/register ]; then
-                echo "手工注册：$QEMU"
-                # F 标志 = 解释器路径固定（不随 chroot 改变），这是跨 chroot 必须的
-                echo ":qemu-aarch64:M::\\x7f\\x45\\x4c\\x46\\x02\\x01\\x01\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x02\\x00\\xb7\\x00::${QEMU}:F" \
-                  > /proc/sys/fs/binfmt_misc/register 2>/dev/null || true
-              fi
+            # 途径 2：把包里的注册串写进内核接口
+            if [ ! -e /proc/sys/fs/binfmt_misc/qemu-aarch64 ] && [ -n "$CONF" ]; then
+              echo "用 $CONF 注册"
+              [ -w /proc/sys/fs/binfmt_misc/register ] \
+                && cat "$CONF" > /proc/sys/fs/binfmt_misc/register 2>/dev/null || true
             fi
+            # 途径 3：conf 也没有时用内置的确切值
+            if [ ! -e /proc/sys/fs/binfmt_misc/qemu-aarch64 ] \
+               && [ -w /proc/sys/fs/binfmt_misc/register ] \
+               && [ -x /usr/bin/qemu-aarch64 ]; then
+              echo "用内置的确切值注册"
+              printf '%s\n' \
+                ':qemu-aarch64:M::\x7f\x45\x4c\x46\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\xb7\x00:\xff\xff\xff\xff\xff\xff\xff\x00\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff:/usr/bin/qemu-aarch64:OPF' \
+                > /proc/sys/fs/binfmt_misc/register 2>/dev/null || true
+            fi
+
             if [ ! -e /proc/sys/fs/binfmt_misc/qemu-aarch64 ]; then
-              echo "::error::无法注册 qemu-aarch64 binfmt handler —— 容器缺少 CAP_SYS_ADMIN？"
-              echo "需要 container.options 里有 --privileged（见 build.yml 的 jobs.build.container）"
+              echo "::error::无法注册 qemu-aarch64 handler"
+              echo "若 qemu-aarch64 缺失 -> apt 里要加 qemu-user（qemu-user-binfmt 只是配置包）"
+              echo "若 register 不可写   -> container.options 需要 --privileged"
               exit 1
             fi
           fi
