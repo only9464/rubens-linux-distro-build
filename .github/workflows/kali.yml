@@ -1,0 +1,1383 @@
+name: 构建 rubens Kali (kali-rolling)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 这个 workflow 与 build.yml 是**同一个移植的两套用户空间**：
+#
+#   内核 / DTB / 固件 / ramdisk / boot.img 打包  →  完全相同
+#   内核编译缓存（actions/cache 的 key）        →  刻意相同，见下面「共享内核缓存」
+#   只有 rootfs 的发行版后端不同                →  distros/kali.sh 而不是 ubuntu.sh
+#
+# 也就是说 Kali 不需要重新验证任何内核侧的东西：内核与用户空间无关，
+# build.yml 里已经实测可启动的那套（clang 21 / in-tree 构建 / kernel-cache
+# 形状 / LK 体积预算）在这里原样复用。
+#
+# ── 为什么是 kali-rolling ──
+#
+# Kali 只有滚动发布，没有 LTS。归档里同时存在这些 suite：
+#   kali-rolling        ← 持续更新，就是「最新版 Kali」，本文件用它
+#   kali-last-snapshot  ← 冻结的季度快照
+#   kali-dev / kali-bleeding-edge  ← 开发版，不要用
+# 换成快照只要改 --suite 并同步改 SUITE= 即可，其余步骤都不用动。
+#
+# ── 与 Ubuntu 后端的三处实质差异（详见「写入 Kali 发行版后端」） ──
+#
+#   1. Kali 的 arm64 在**主归档**上（http.kali.org/kali），
+#      不是 Ubuntu 那样的 ports 归档 —— 所以没有 ports 那套 URL 规则。
+#   2. Kali 没有 -updates / -security 这两个 pocket。rolling 本身就是
+#      持续更新，写这两个 pocket 会让 apt update 直接 404。
+#   3. Kali 的包由 kali-archive-keyring 签名，Ubuntu/Debian 的钥匙串
+#      验证不了。仓库**同时**提供该包，所以由 bootstrap 自己把它装进
+#      目标系统 —— 这样 sources.list 里不需要 signed-by，也不需要
+#      --keyring，和 Kali 官方 build-rootfs.sh 的做法一致。
+#      CI 侧只额外做一次「指纹核对」，用来确认镜像给的是真钥匙。
+#
+# ── 关于 --privileged 与 qemu binfmt ──
+#
+# 与 build.yml 同因同果，不重复展开：mmdebstrap 的 root 模式要
+# CAP_SYS_ADMIN，在 x86-64 runner 上构建 arm64 rootfs 还要能写
+# /proc/sys/fs/binfmt_misc。缺了它 rootfs 阶段必然失败。
+# ─────────────────────────────────────────────────────────────────────────────
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_kali_tools:
+        description: '额外装 Kali 工具集（kali-linux-headless：nmap/metasploit/hashcat…，镜像约 3-5 GB）'
+        required: false
+        default: false
+        type: boolean
+
+      build_desktop:
+        description: '把 XFCE 桌面打进镜像（kali-desktop-xfce，约 2 GB，可与上一项叠加）'
+        required: false
+        default: false
+        type: boolean
+
+      force_kernel_rebuild:
+        description: '忽略内核缓存，强制重编内核（改了补丁/配置却想复用旧 workflow 时用）'
+        required: false
+        default: false
+        type: boolean
+
+      mirror:
+        description: 'Kali 归档地址（留空 = 清华 TUNA；官方源填 https://http.kali.org/kali）'
+        required: false
+        default: ''
+        type: string
+
+env:
+  # 与 build.yml 完全相同的内核来源与基线（实测可启动的组合）。
+  # 两处必须保持一致，否则两个 workflow 产出的是不同内核，缓存也无法共享。
+  DEFAULT_KERNEL_REPO:   https://github.com/MT6895-Mainline/linux.git
+  DEFAULT_KERNEL_BRANCH: port/rubens-clean
+  DEFAULT_KERNEL_COMMIT: 80d38270aacdcb17db3cba8cfb522bf248f354f6
+
+  ROOTFS_REPO:    https://github.com/MT6895-Mainline/rootfs.git
+
+  # ── Kali 相关 ──
+  # 只有一个 suite、一个归档。这四个组件在 arm64 上都存在（已核对
+  # kali-rolling 的 Release: Architectures: i386 amd64 armhf arm64）：
+  #   non-free-firmware 里有 firmware-mediatek，是 WiFi/蓝牙/GPU 固件的
+  #   可分发来源；厂商 blob 仍由本仓库的 firmware/ 提供。
+  KALI_SUITE:      kali-rolling
+  KALI_COMPONENTS: main contrib non-free non-free-firmware
+  KALI_MIRROR:     https://mirrors.tuna.tsinghua.edu.cn/kali
+
+  # kali-archive-keyring 的 pool 目录。取自**官方**归档而不是镜像，
+  # 少一层「镜像同步了什么」的不确定性；池目录按 Debian 政策按源码包首字母
+  # 分层，路径稳定。版本号刻意不写死（见「准备 Kali 归档钥匙」）。
+  KALI_POOL_KEYRING: https://http.kali.org/kali/pool/main/k/kali-archive-keyring
+
+  # 构建期（CI 容器里）核对用的指纹，来自 kali-archive-keyring_2025.2。
+  # 这只是**可信度检查**，不是安全边界：真正的签名验证由 apt 用
+  # 上面那个包里的钥匙串完成。
+  KALI_KEY_FPR: 827C8569F2518CC677FECA1AED65462EC8D5E4C5
+
+  # LK 是厂商 bootloader，有硬性体积上限（与 build.yml 同值）：
+  #   0x3640000 实测能启动；0x3820000 会复位循环。超过就别刷。
+  IMAGE_SIZE_BUDGET: "0x3640000"
+
+  # 内核缓存的版本号。**改了内核配置、补丁或构建方式就把它 +1**。
+  #
+  # ⚠️ 这个值必须与 build.yml 里的完全一致，见下面「共享内核缓存」。
+  CACHE_VERSION: v1
+
+jobs:
+  build:
+    # 只是宿主；真正的构建环境是下面的容器
+    runs-on: ubuntu-26.04
+    container:
+      image: ubuntu:26.04      # 与本地验证环境一致的工具链
+      # --privileged 是**必需**的，不是图省事：
+      #
+      # mmdebstrap 的 root/sudo 模式（以 root 运行时 auto 会选它）手册明确写着
+      # "This mode needs to be able to mount and thus requires CAP_SYS_ADMIN"。
+      # 而 -e 下的 systemctl enable、grub 探测等也需要 chroot 里有 /proc 与 /sys。
+      #
+      # 同样地，在 x86-64 runner 上跑 arm64 的 apt/dpkg 需要向
+      # /proc/sys/fs/binfmt_misc 注册 qemu-aarch64 handler，而写入该目录
+      # 也需要 CAP_SYS_ADMIN —— 所以少了它，装 qemu-user-binfmt 也没用。
+      #
+      # 这个容器里跑的只是本仓库自己的构建脚本，不执行外部不可信输入。
+      options: --user root --privileged
+    timeout-minutes: 180
+
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      # ────────────────────────────────────────────── 1. 安装工具链
+      - name: 安装编译工具链
+        run: |
+          set -euxo pipefail
+          apt-get update
+          apt-get install -y --no-install-recommends sudo \
+            clang lld llvm \
+            make bc bison flex libssl-dev libelf-dev \
+            device-tree-compiler \
+            cpio gzip xz-utils zstd lz4 \
+            python3 python3-pip \
+            git rsync patch curl wget ca-certificates file \
+            mmdebstrap \
+            kmod e2fsprogs util-linux \
+            android-sdk-libsparse-utils \
+            mkbootimg \
+            qemu-user qemu-user-binfmt binfmt-support arch-test
+
+      # 在 x86-64 runner 上构建 arm64 rootfs，必须让内核能执行 arm64 二进制：
+      # qemu-user-binfmt 会为 qemu-aarch64 注册 binfmt_misc handler。
+      #
+      # 这一步单独成一节，是因为**注册需要 CAP_SYS_ADMIN**：没有它
+      # /proc/sys/fs/binfmt_misc 是空的，mmdebstrap 会一路走下坡：
+      #   W: cannot mount because CAP_SYS_ADMIN is not in the effective set
+      #   unshare: unshare failed: Operation not permitted
+      #   E: install arch-test for foreign architecture support
+      # 所以容器必须带 --privileged，见 jobs.<job>.container。
+      - name: 检查 arm64 二进制能否执行（qemu binfmt）
+        run: |
+          set -euxo pipefail
+          echo "=== 前置事实 ==="
+          echo "qemu-aarch64    : $(command -v qemu-aarch64 || echo '❌ 缺失（qemu-user 没装上）')"
+          echo "binfmt_misc 挂载: $(mount | grep -c binfmt_misc) 个"
+
+          # 没有 binfmt_misc 挂载时，register 自然不可写 —— 用 --privileged 拿到
+          # CAP_SYS_ADMIN 后可以自己挂上。
+          if ! grep -q 'binfmt_misc' /proc/mounts; then
+            echo "binfmt_misc 未挂载，尝试挂载"
+            mount -t binfmt_misc binfmt_misc /proc/sys/fs/binfmt_misc 2>&1 | sed 's/^/  /' || true
+          fi
+          CAN_REG=no
+          [ -w /proc/sys/fs/binfmt_misc/register ] && CAN_REG=yes
+          echo "register 可写   : $CAN_REG"
+          echo "现有 handler    :"
+          ls /proc/sys/fs/binfmt_misc/ 2>/dev/null | head -20 | sed 's/^/  /'
+
+          if [ ! -e /proc/sys/fs/binfmt_misc/qemu-aarch64 ]; then
+            echo "::warning::qemu-aarch64 未注册，尝试注册"
+
+            # 注册串**直接用包自带的**，不要自己拼。qemu-user 提供
+            #   /usr/share/qemu/binfmt.d/qemu-aarch64.conf
+            # qemu-user-binfmt 把它装到 /usr/lib/binfmt.d/ 供 systemd-binfmt 读。
+            # 标志是 OPF（O=保留 argv[0]，P=保留原 argv，F=解释器路径固定），
+            # 不是只有 F。
+            CONF=""
+            for c in /usr/lib/binfmt.d/qemu-aarch64.conf \
+                     /usr/share/qemu/binfmt.d/qemu-aarch64.conf; do
+              [ -f "$c" ] && CONF="$c" && break
+            done
+
+            # 途径 1：systemd-binfmt（容器里一般没有 systemd 在跑，多半无效）
+            if command -v systemd-binfmt >/dev/null 2>&1; then
+              systemd-binfmt --no-pager 2>/dev/null || true
+            fi
+            # 途径 2：把包里的注册串写进内核接口
+            if [ ! -e /proc/sys/fs/binfmt_misc/qemu-aarch64 ] && [ -n "$CONF" ]; then
+              echo "用 $CONF 注册"
+              [ -w /proc/sys/fs/binfmt_misc/register ] \
+                && cat "$CONF" > /proc/sys/fs/binfmt_misc/register 2>/dev/null || true
+            fi
+            # 途径 3：conf 也没有时用内置的确切值
+            if [ ! -e /proc/sys/fs/binfmt_misc/qemu-aarch64 ] \
+               && [ -w /proc/sys/fs/binfmt_misc/register ] \
+               && [ -x /usr/bin/qemu-aarch64 ]; then
+              echo "用内置的确切值注册"
+              printf '%s\n' \
+                ':qemu-aarch64:M::\x7f\x45\x4c\x46\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\xb7\x00:\xff\xff\xff\xff\xff\xff\xff\x00\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff:/usr/bin/qemu-aarch64:OPF' \
+                > /proc/sys/fs/binfmt_misc/register 2>/dev/null || true
+            fi
+
+            if [ ! -e /proc/sys/fs/binfmt_misc/qemu-aarch64 ]; then
+              echo "::error::无法注册 qemu-aarch64 handler"
+              echo "若 qemu-aarch64 缺失 -> apt 里要加 qemu-user（qemu-user-binfmt 只是配置包）"
+              echo "若 register 不可写   -> container.options 需要 --privileged"
+              exit 1
+            fi
+          fi
+          echo "qemu-aarch64 handler:"
+          cat /proc/sys/fs/binfmt_misc/qemu-aarch64
+
+          # 用 arch-test 真跑一个 arm64 二进制（比自造的 ELF 头可靠：
+          # 一个只有 ELF 头、没有合法节表的文件会被 qemu 拒绝，不能作为判据）。
+          # mmdebstrap 自己也是靠它判断能否构建外架构 rootfs。
+          if arch-test arm64; then
+            echo "✅ arm64 可执行（qemu binfmt 生效）"
+          else
+            echo "::error::arm64 无法执行，mmdebstrap 处理不了 arm64 的 apt/dpkg"
+            echo "需要 container.options 含 --privileged（见 jobs.build.container）"
+            exit 1
+          fi
+
+      - name: 检查工具链版本
+        run: |
+          set -euxo pipefail
+          . /etc/os-release
+          echo "构建环境: $PRETTY_NAME"
+          clang --version | head -1
+          ld.lld --version | head -1
+          echo "mmdebstrap: $(mmdebstrap --version)"
+          echo "lz4: $(/usr/bin/lz4 --version 2>&1 | head -1)"
+          echo "make: $(make --version | head -1)"
+
+          CLANG=$(clang --version | grep -oP 'version \K[0-9]+' | head -1)
+          LZ4V=$(/usr/bin/lz4 --version 2>&1 | grep -oP 'v\K[0-9.]+')
+          MMDB=$(mmdebstrap --version | awk '{print $2}')
+
+          fail=0
+          # clang：本移植用 21.1.8 验证；20 以上应可用，低于 20 编不过
+          [ "$CLANG" -ge 20 ] || { echo "::error::clang $CLANG 太旧（需要 20+）"; fail=1; }
+          # lz4：1.9.x 在 legacy 模式下产出的流内核解压不了
+          case "$LZ4V" in
+            1.9.*) echo "::error::lz4 $LZ4V 会在 legacy 模式下产出内核不认的流"; fail=1 ;;
+          esac
+          # mmdebstrap：Kali 后端用到的是 --include 与位置参数镜像，
+          # 1.5 起还支持把 `deb [...]` 形式的整行写进 sources.list。
+          case "$MMDB" in
+            1.[0-4].*|1.[0-4]) echo "::warning::mmdebstrap $MMDB 偏旧，构建可能失败" ;;
+          esac
+          [ "$fail" = 0 ] || exit 1
+          echo "✅ 工具链满足要求"
+
+          # 打包 boot.img 需要的工具。
+          #
+          # 注意：mkbootimg 在 Ubuntu 26.04 里是 universe 的正式包
+          # （source: android-platform-tools），直接用 apt 装即可。
+          # 不要用 pip —— 26.04 是 PEP 668 的 externally-managed 环境，
+          # pip 会拒绝安装（除非加 --break-system-packages）。
+          for t in mkbootimg simg2img lz4 cpio gzip; do
+            printf '  %-12s %s\n' "$t" "$(command -v $t || echo '❌ 缺失')"
+            command -v "$t" >/dev/null 2>&1 || { echo "::error::$t 不可用"; fail=1; }
+          done
+          mkbootimg --help >/dev/null 2>&1 && echo "  mkbootimg 可正常执行"
+          [ "$fail" = 0 ] || exit 1
+
+      # 预检 build.sh 要求的**全部**宿主工具。
+      #
+      # 上游 build.sh 里那一行是：
+      #   for tool in mmdebstrap mkfs.ext4 zstd du findmnt depmod
+      # 另加 build.sh 实际会调用、但不在该循环里的 img2simg / llvm-strip。
+      # 容器是精简的 ubuntu:26.04，这些工具不会"顺便"带上，必须显式安装 +
+      # 显式检查 —— 否则会在内核编了几十分钟之后才报错。
+      - name: 预检 rootfs 构建所需的宿主工具
+        run: |
+          set -euxo pipefail
+          fail=0
+          check() {
+            if command -v "$1" >/dev/null 2>&1; then
+              printf '  ✅ %-12s %s\n' "$1" "$(command -v "$1")"
+            else
+              printf '  ❌ %-12s 缺失（包: %s）\n' "$1" "$2"
+              fail=1
+            fi
+          }
+          echo "build.sh 的 requires 列表："
+          check mmdebstrap  mmdebstrap
+          check mkfs.ext4   e2fsprogs
+          check zstd        zstd
+          check du          coreutils
+          check findmnt     util-linux
+          check depmod      kmod
+          echo "build.sh 会调用但不在 requires 列表里的："
+          check img2simg    android-sdk-libsparse-utils
+          check llvm-strip  llvm
+          [ "$fail" = 0 ] || { echo "::error::容器缺少 rootfs 构建所需的宿主工具"; exit 1; }
+          echo "✅ 宿主工具齐备"
+
+      # ────────────────────────────────────────────── 2. 准备 Kali 归档钥匙
+      #
+      # mmdebstrap 需要一把可信的钥匙来验证 Kali 归档的 InRelease。它**不会**
+      # 自己去下载钥匙串：唯一的内置来源是宿主机的
+      # /usr/share/keyrings/kali-archive-keyring.gpg，而容器里没有这个包
+      # （它只存在于 Kali 归档里，Ubuntu 的源里没有）。
+      #
+      # 所以从**官方**归档的 pool 里把 kali-archive-keyring 这个 .deb 拿下来，
+      # 只解出里面的钥匙串交给 mmdebstrap。这与 Kali 官方 build-rootfs.sh 的
+      # 前提一致（它就是拿宿主机 /usr/share/keyrings/kali-archive-keyring.gpg）。
+      #
+      # 版本号不写死：pool 目录列表会随 Kali 更新，写死会在下次发布时突然 404。
+      # ---------------------------------------------------------------------
+      # 产物：$GITHUB_WORKSPACE/kali-keyring/ex/usr/share/keyrings/kali-archive-keyring.gpg
+      # 后面「构建 rootfs」把它用 `sudo --preserve-env=KALI_KEYRING` 传给 build.sh
+      # —— 必须显式保留：sudoers 默认 env_reset，不加这个变量会被丢掉。
+      # ---------------------------------------------------------------------
+      - name: 准备 Kali 归档钥匙（kali-archive-keyring）
+        run: |
+          set -euxo pipefail
+          mkdir -p kali-keyring
+          cd kali-keyring
+
+          echo "== 列出 pool 目录，取最新版 =="
+          # 目录索引里同时有 .deb/.dsc/.buildinfo/...，只留 all.deb
+          DEB=$(
+            curl -fsSL "$KALI_POOL_KEYRING/" 2>/dev/null \
+              | grep -oE 'kali-archive-keyring_[^"<>]+_all\.deb' \
+              | sort -uV | tail -1 || true
+          )
+          if [ -z "$DEB" ]; then
+            echo "::error::无法从 $KALI_POOL_KEYRING/ 解析出 kali-archive-keyring 的 .deb"
+            echo "该目录的当前内容："
+            curl -fsSL "$KALI_POOL_KEYRING/" 2>/dev/null | grep -oE 'href="[^"]+"' | head -20 || true
+            exit 1
+          fi
+          echo "选定: $DEB"
+
+          # 加重试：这一步在 apt 之前，没有任何缓存可依赖
+          curl -fsSL --retry 5 --retry-delay 3 --retry-all-errors \
+            -o "$DEB" "$KALI_POOL_KEYRING/$DEB"
+          ls -l "$DEB"
+
+          echo "== 校验这确实是个 Debian 包 =="
+          dpkg-deb --info "$DEB" | sed -n '1,12p'
+
+          echo "== 只解出钥匙串 =="
+          rm -rf ex
+          dpkg-deb --fsys-tarfile "$DEB" \
+            | tar -x -C . --one-top-level=ex \
+                ./usr/share/keyrings/kali-archive-keyring.gpg
+
+          KR="$PWD/ex/usr/share/keyrings/kali-archive-keyring.gpg"
+          [ -s "$KR" ] || { echo "::error::包里没有 kali-archive-keyring.gpg"; exit 1; }
+          echo "钥匙串: $KR ($(stat -c %s "$KR") 字节)"
+
+          echo "== 指纹核对 =="
+          # 容器里没有 Kali 的钥匙串，这是唯一能验证的来源；核对通过才继续。
+          gpg --no-default-keyring --keyring "$KR" --list-keys --with-colons \
+            > fpr.txt 2>/dev/null || { echo "::error::gpg 无法读取钥匙串"; cat fpr.txt; exit 1; }
+          echo "钥匙串里的密钥："
+          awk -F: '/^fpr:/{print "  "$10}' fpr.txt
+
+          if ! grep -qF "$KALI_KEY_FPR" fpr.txt; then
+            echo "::error::钥匙串里没有预期指纹 $KALI_KEY_FPR"
+            echo "要么 Kali 换了签名密钥（那就更新 env.KALI_KEY_FPR），"
+            echo "要么这个 .deb 不是真的 —— 先别继续构建。"
+            exit 1
+          fi
+          echo "✅ 指纹匹配：$KALI_KEY_FPR"
+
+          echo "KR=$KR" >> "$GITHUB_ENV"
+          echo "KALI_KEYRING_DEB=$DEB" >> "$GITHUB_ENV"
+
+      # ────────────────────────────────────────────── 3. 克隆内核
+      #
+      # 以下到「把编译结果做成 build.sh 的内核缓存」为止，与 build.yml
+      # 逐字对应。内核来源是**固定**的（本仓库实测可启动的那一套），
+      # 不像 build.yml 那样开放成输入 —— 换内核时请先让 build.yml 验证通过。
+      - name: 克隆内核源码
+        run: |
+          set -euxo pipefail
+          REPO="$DEFAULT_KERNEL_REPO"
+          BRANCH="$DEFAULT_KERNEL_BRANCH"
+          COMMIT="$DEFAULT_KERNEL_COMMIT"
+          echo "内核仓库: $REPO"
+          echo "分支    : $BRANCH"
+          echo "commit  : $COMMIT"
+
+          # 用 blob 过滤克隆：历史完整（能解析任意 SHA），但不下载文件内容，
+          # checkout 时才按需拉取，比全量克隆快很多。
+          git clone --filter=blob:none "$REPO" kernel
+          cd kernel
+          git config --global --add safe.directory "$PWD"
+
+          echo "指定了 commit: $COMMIT"
+          if [ ${#COMMIT} -eq 40 ] && [[ "$COMMIT" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "  识别为完整 SHA"
+            git fetch --depth 1 origin "$COMMIT"
+            git checkout "$COMMIT"
+          elif git fetch --depth 1 origin "refs/tags/$COMMIT" 2>/dev/null; then
+            echo "  识别为 tag"
+            git checkout "FETCH_HEAD"
+          else
+            echo "  识别为短 SHA 或分支名，拉取 $BRANCH 的历史后在本地匹配"
+            if ! git fetch --depth 200 origin "$BRANCH" 2>/dev/null; then
+              echo "  浅取失败，改为取该分支的完整历史"
+              git fetch origin "$BRANCH"
+            fi
+            FULL=$(git rev-parse --verify "${COMMIT}^{commit}" 2>/dev/null || true)
+            if [ -z "$FULL" ]; then
+              echo "::error::在 $BRANCH 的历史里找不到 commit '$COMMIT'"
+              exit 1
+            fi
+            echo "  解析为完整 SHA: $FULL"
+            git checkout "$FULL"
+          fi
+
+          git checkout -b rubens-kali 2>/dev/null || git checkout -B rubens-kali
+          echo
+          echo "已检出:"
+          git log --oneline -1
+
+      # ────────────────────────────────────────────── 4. 恢复内核缓存（跨 run 复用）
+      #
+      # ── 共享内核缓存（刻意为之，不是复制粘贴的疏漏） ──
+      #
+      # 这个 key 与 build.yml 里的**逐字节相同**（已核对），因此：
+      #   * 先用 build.yml 编过一次内核，再来跑 kali.yml，这里直接命中，
+      #     整轮从约 100 分钟降到约 20 分钟；
+      #   * actions/cache 按仓库共享，两个 workflow 不会各存一份约 1 GB 的缓存
+      #     （否则会更快触到每仓库 10 GB 的上限）。
+      #
+      # 之所以能这样共享：缓存的指纹只含「内核 commit + 内核配置 + 补丁」
+      # 三项，全部与用户空间无关，而 kali.yml 这三项与 build.yml 的默认值一致。
+      #
+      # ⚠️ 两个前提，破坏任一条就不再共享（不会出错，只是要多编一次内核）：
+      #   1. 跑 build.yml 时**不要填** kernel_repo / kernel_branch / kernel_commit
+      #      —— 一旦填了，它的 key 里就是那个自定义 commit 而不是默认的
+      #      80d38270…，两边自然对不上。
+      #   2. 两个文件的 CACHE_VERSION 必须一起改。
+      #
+      # 反过来说 —— **只要有一边改了 configs/ 或 patches/，两边都会自动失效**
+      # 并各自重编，这是正确行为，不是 bug。
+      #
+      # 刻意**不设 restore-keys**：前缀回退会命中"别的 commit / 别的配置"编出来的
+      # 内核，而内核与 /lib/modules 必须严格配对，用错会静默产出模块全部失配的
+      # 镜像。宁可缓存不命中、重编一次，也不要拿错的内核。
+      - name: 恢复内核缓存
+        id: kcache
+        uses: actions/cache/restore@v4
+        with:
+          path: kernel-cache
+          key: >-
+            kernel-${{ env.CACHE_VERSION }}-${{
+              inputs.force_kernel_rebuild == true && 'nocache' ||
+              format('{0}-{1}', env.DEFAULT_KERNEL_COMMIT, hashFiles('configs/kernel.config', 'configs/mt6895-fixups.config', 'patches/0001-rubens-port-fixes.patch'))
+            }}
+
+      - name: 判断是否真的要编内核
+        run: |
+          HIT="${{ steps.kcache.outputs.cache-hit }}"
+          if [ "${{ inputs.force_kernel_rebuild }}" = "true" ]; then
+            HIT="false"
+            echo "指定了 force_kernel_rebuild，忽略缓存"
+          fi
+          if [ "$HIT" = "true" ] && [ -f kernel-cache/arch/arm64/boot/Image ] \
+             && [ -f kernel-cache/Module.symvers ] && [ -f kernel-cache/.config ] \
+             && [ -f kernel-cache/include/config/kernel.release ]; then
+            echo "SKIP_KERNEL_BUILD=1" >> "$GITHUB_ENV"
+            echo "✅ 内核缓存命中 —— 跳过编译（省下约 77 分钟）"
+            echo "   Image : $(stat -c %s kernel-cache/arch/arm64/boot/Image) 字节"
+            echo "   模块  : $(find kernel-cache -name '*.ko' | wc -l) 个"
+            echo "   版本  : $(cat kernel-cache/include/config/kernel.release)"
+          else
+            echo "SKIP_KERNEL_BUILD=0" >> "$GITHUB_ENV"
+            if [ "$HIT" = "true" ]; then
+              echo "::warning::缓存标记命中但内容不完整，改为重新编译"
+            else
+              echo "未命中内核缓存 —— 本次会完整编译（约 77 分钟）"
+            fi
+          fi
+          # build.sh 需要一个**带 .git 的内核仓库**来铺源码（缓存命中时会跑
+          # `git -C "$KERNEL_REPO" archive`）。kernel/ 因此始终是全新克隆，
+          # 不依赖缓存里是否保住了嵌套的 .git —— 那是 actions/cache 的常见坑。
+          [ -d kernel/.git ] || { echo "::error::kernel/ 不是 git 仓库"; exit 1; }
+          echo "内核源码仓库 kernel/ 就绪（含 .git）"
+
+      - name: 应用移植补丁
+        if: env.SKIP_KERNEL_BUILD != '1'
+        id: patch
+        run: |
+          set -euxo pipefail
+          cd kernel
+          git config --global --add safe.directory "$PWD"
+          git config --global user.name ci
+          git config --global user.email ci@localhost
+          git am --3way ../patches/0001-rubens-port-fixes.patch
+          # 工作区必须干净：否则 setlocalversion 会给内核版本追加 '+'，
+          # 导致 uname -r 变成 7.2.0+ 而 /lib/modules/7.2.0 里的模块全部失配
+          git status --porcelain
+          test -z "$(git status --porcelain)" || {
+            echo "::error::工作区不干净，内核版本号会带 + 后缀"
+            exit 1
+          }
+          git log --oneline -2
+
+      # 换用别的内核 commit 时，补丁可能对不上。这里把冲突细节打出来。
+      - name: 补丁冲突排查
+        if: failure() && steps.patch.outcome == 'failure'
+        run: |
+          cd kernel || exit 0
+          echo "::group::无法应用的 hunk"
+          git am --show-current-patch=diff 2>/dev/null | head -80 || true
+          echo "::endgroup::"
+          echo "::group::冲突文件"
+          git status --short 2>/dev/null || true
+          echo "::endgroup::"
+          echo "提示：若换了内核基线，patches/0001-rubens-port-fixes.patch"
+          echo "      可能需要重新生成（见 docs/BUILD.md §3.1）。"
+
+      # 上游 MT6895-Mainline/linux 把内核构建产物也提交进了仓库
+      # （include/config、include/generated 等）。而 make 的 outputmakefile 规则
+      # 会据此判定"源码树不干净"，直接拒绝构建：
+      #
+      #   *** The source tree is not clean, please run 'make ARCH=arm64 mrproper'
+      - name: 清理内核源码树
+        if: env.SKIP_KERNEL_BUILD != '1'
+        run: |
+          set -euxo pipefail
+          cd kernel
+          # 顺序很重要：mrproper 会把 .config 一起删掉，所以必须在写配置之前跑。
+          make ARCH=arm64 mrproper
+          git clean -xdf
+          echo
+          echo "清理后的状态："
+          git status --porcelain | head || true
+          for p in include/config include/generated .config; do
+            if [ -e "$p" ]; then
+              echo "::warning::$p 仍然存在，make 可能仍报 'not clean'"
+            else
+              echo "  ✅ $p 已清除"
+            fi
+          done
+
+      # 配置放在**源码树根**，做 in-tree 构建：in-tree 产出的树正是
+      # rootfs/build.sh 的缓存形状（$KBOUT），这样内核只编一遍。
+      #
+      # 这里不触发 Makefile 的 "source tree is not clean" 守卫：那个守卫整段
+      # 包在 `ifdef building_out_of_srctree` 里，而该变量只在用了 O= 时才被赋值。
+      - name: 写入内核配置
+        if: env.SKIP_KERNEL_BUILD != '1'
+        run: |
+          set -euxo pipefail
+          cd kernel
+          cp ../configs/kernel.config .config
+          make ARCH=arm64 LLVM=1 olddefconfig
+
+          echo "抽查关键配置项："
+          grep -E '^CONFIG_XIAOMI_RUBENS=y'           .config
+          grep -E '^CONFIG_MTK_COMBO=y'               .config
+          grep -E '^CONFIG_MTK_BTIF=y'                .config
+          grep -E '^CONFIG_MTK_TINYSYS_SCP_SUPPORT=y' .config
+          grep -E '^CONFIG_PSTORE_BLK=y'              .config
+          grep -E '^CONFIG_DRM_PANTHOR=y'             .config
+          grep -qE '^# CONFIG_KALLSYMS_ALL is not set' .config
+
+      # 必须先单独编 dtbs：arch/arm64/kernel/Makefile 里的 DTB 规则标了 FORCE，
+      # 而它调用子 make 时漏传 O=$(objtree)，会跑回源码树找 .config 而失败。
+      # 先编 dtbs 把文件落到盘上，该规则随后成为 no-op。
+      - name: 编译设备树
+        if: env.SKIP_KERNEL_BUILD != '1'
+        run: |
+          set -euxo pipefail
+          cd kernel
+          make -C . ARCH=arm64 LLVM=1 dtbs
+          test -f arch/arm64/boot/dts/mediatek/mt6895-xiaomi-rubens.dtb
+
+      - name: 编译内核与模块
+        if: env.SKIP_KERNEL_BUILD != '1'
+        run: |
+          set -euxo pipefail
+          cd kernel
+          # LOCALVERSION= 显式设为空串，阻止 setlocalversion 追加 '+'
+          LOCALVERSION= make -C . ARCH=arm64 LLVM=1 \
+            -j"$(nproc)" Image modules 2>&1 | tail -30
+
+      # 统一「这次用哪棵树」：命中缓存就是 kernel-cache/，否则是刚编好的 kernel/。
+      - name: 确定本次使用的内核树
+        run: |
+          set -euxo pipefail
+          if [ "${SKIP_KERNEL_BUILD:-0}" = "1" ]; then
+            DIR=kernel-cache
+          else
+            DIR=kernel
+          fi
+          for f in arch/arm64/boot/Image .config Module.symvers \
+                   include/config/kernel.release; do
+            [ -f "$DIR/$f" ] || { echo "::error::$DIR 缺 $f"; exit 1; }
+          done
+          N=$(find "$DIR" -name '*.ko' | wc -l)
+          [ "$N" -gt 1500 ] || { echo "::error::$DIR 只有 $N 个 .ko"; exit 1; }
+          echo "KERNEL_DIR=$DIR" >> "$GITHUB_ENV"
+          echo "本次内核树: $DIR（$N 个 .ko，$(du -sh "$DIR" | cut -f1)）"
+
+      - name: 校验内核（体积 / 版本 / 配置 / DTB）
+        run: ./scripts/verify-kernel.sh "$KERNEL_DIR"
+
+      - name: 未命中缓存时建立 kernel-cache
+        if: env.SKIP_KERNEL_BUILD != '1'
+        run: |
+          set -euxo pipefail
+          rm -rf kernel-cache
+          NEED_KB=$(du -sk kernel | cut -f1)
+          AVAIL_KB=$(df -Pk . | awk 'NR==2 {print $4}')
+          echo "需要 $((NEED_KB/1024)) MB / 可用 $((AVAIL_KB/1024)) MB"
+          [ "$AVAIL_KB" -ge "$NEED_KB" ] || { echo "::error::空间不足"; df -h .; exit 1; }
+          cp -a kernel kernel-cache
+          echo "已建立 kernel-cache（$(du -sh kernel-cache | cut -f1)）"
+
+      # ────────────────────────────────────────────── 5. 构建系统镜像
+      - name: 克隆 rootfs 构建器
+        run: git clone --depth 1 "$ROOTFS_REPO" rootfs-builder
+
+      # 缓存的形状必须是「源码树根」（$KBOUT），因为 build.sh 会：
+      #   cp -a "$KERNEL_CACHE/." "$KBOUT/"
+      #   git -C "$KERNEL_REPO" archive <commit> | tar -x -C "$KBOUT" --keep-old-files
+      #   make -C "$KBOUT" modules_install
+      # 而上面的内核就是 in-tree 构建的，产出的树天然是这个形状。
+      - name: 把编译结果做成 build.sh 的内核缓存
+        run: |
+          set -euxo pipefail
+          mkdir -p rootfs-builder/out
+          rm -rf rootfs-builder/out/kernel-cache
+
+          NEED_KB=$(du -sk "$KERNEL_DIR" | cut -f1)
+          AVAIL_KB=$(df -Pk . | awk 'NR==2 {print $4}')
+          echo "来源 : $KERNEL_DIR"
+          echo "需要 : $((NEED_KB/1024)) MB / 可用 $((AVAIL_KB/1024)) MB"
+          if [ "$AVAIL_KB" -lt "$NEED_KB" ]; then
+            echo "::error::磁盘空间不足（需 $((NEED_KB/1024)) MB，可用 $((AVAIL_KB/1024)) MB）"
+            df -h .
+            exit 1
+          fi
+
+          cp -a "$KERNEL_DIR" rootfs-builder/out/kernel-cache
+
+          CACHE=rootfs-builder/out/kernel-cache
+          for f in arch/arm64/boot/Image .config Module.symvers \
+                   include/config/kernel.release; do
+            test -f "$CACHE/$f" || { echo "::error::缓存缺 $f"; exit 1; }
+          done
+
+          # 形状自检：Makefile 必须是真内核 Makefile，不能是 O=out 包装器。
+          #
+          # 判据必须是**第一行**，不能是「文件里包含该字符串」——真内核
+          # Makefile 第 698 行就有这句（它正是生成包装器的那段代码）：
+          #   echo "\# Automatically generated by $(abs_srctree)/Makefile: don't edit"
+          # 所以整文件 grep 会把真 Makefile 误判成包装器。
+          FIRST=$(head -1 "$CACHE/Makefile")
+          echo "Makefile 首行: $FIRST"
+          case "$FIRST" in
+            '# Automatically generated by'*)
+              echo "::error::缓存是 O=out 包装器形状，build.sh 会跳回错误路径"
+              head -3 "$CACHE/Makefile"
+              exit 1 ;;
+            '# SPDX-License-Identifier:'*)
+              echo "✅ 缓存形状正确（真内核 Makefile），build.sh 将跳过内核编译" ;;
+            *)
+              echo "::warning::Makefile 首行不是预期值，请人工确认"
+              head -3 "$CACHE/Makefile" ;;
+          esac
+
+          REL=$(cat "$CACHE/include/config/kernel.release")
+          echo "缓存内核版本 : $REL"
+          echo "Image        : $(stat -c %s "$CACHE/arch/arm64/boot/Image") 字节"
+          echo "模块         : $(find "$CACHE" -name '*.ko' | wc -l) 个"
+          echo "大小         : $(du -sh "$CACHE" | cut -f1)"
+          echo "REL=$REL" >> "$GITHUB_ENV"
+
+      # 上游 MT6895-Mainline/rootfs 的 devices/ 里只有
+      #   pearl.conf  qqcandy.conf  rubens.conf  xaga.conf
+      # 上游的 rubens.conf 是给 Debian 的（DISTRO 由命令行给），且几条
+      # "TODO: confirm" 的值与 build.yml 实测的结果不同：
+      #   KERNEL_LOCALVERSION="+"  → 模块目录会变成 7.2.0+，而 build.yml
+      #                              编出来的内核报告的是 7.2.0（LOCALVERSION= 显式置空）
+      #   DEFAULT_USER="mobian"    → Kali 里没有这个用户
+      #   PACKAGES_EXTRA           → mobian/debian 口径的包列表
+      # 所以这里像 build.yml 一样**现场生成**自己的 profile，不依赖上游。
+      - name: 写入设备 profile
+        run: |
+          set -euxo pipefail
+          cd rootfs-builder
+          mkdir -p devices
+          cat > devices/rubens-kali.conf <<'CONF_EOF'
+          # Device profile: Xiaomi Redmi K50 (rubens) -- Kali Linux (rolling)
+          #
+          # 由 .github/workflows/kali.yml 生成。与 devices/rubens-ubuntu.conf
+          # 的内核侧取值逐项一致 —— 两个 workflow 编的是同一个内核，
+          # 因此内核缓存可以互相命中（见 kali.yml 的「共享内核缓存」）。
+          #
+          # 内核侧：MT6895-Mainline/linux @ port/rubens-clean (Linux 7.2.0)。
+          # CONFIG_XIAOMI_RUBENS=y 让 Image 自带 rubens DTB，setup.c 会覆盖
+          # LK 传进来的 FDT，所以 boot.img 的 cmdline 是被忽略的。
+          DISTRO="kali"
+          SUITE="kali-rolling"
+
+          PLATFORM_NAME="Xiaomi Redmi K50 (rubens)"
+          SOC="mt6895"
+
+          KERNEL_BRANCH="HEAD"
+          KERNEL_CONFIGS="rubens.config"
+          DTS="mt6895-xiaomi-rubens.dts"
+
+          # rubens 移植用 clang 构建（make LLVM=1）；模块必须来自同一工具链。
+          KERNEL_MAKE_ARGS="LLVM=1"
+
+          # 空值 = 内核版本就是 7.2.0，不带 "+" 后缀。
+          # 模块目录名必须与刷入的内核所报告的一致，否则一个模块都加载不了。
+          KERNEL_LOCALVERSION=""
+
+          # 根文件系统：userdata 分区（本机 226 GiB）里的 ext4，
+          # 由 mkfs.ext4 -L <label> 创建；initramfs 按 GPT 分区名找到它。
+          ROOTFS_LABEL="mt6895rubens"
+
+          # Kali 惯例的用户名。Kali 的 base 系统**不自带**普通用户
+          # （base-files 只提供 skeleton），所以由 distros/kali.sh 创建；
+          # build.sh 随后为它写免密 sudo 规则。
+          DEFAULT_USER="kali"
+
+          # 内核设备节点（不是 fastboot 名字），取自本机：
+          #   adb shell su -c 'ls -bl /dev/block/by-name/{userdata,nvdata}'
+          USERDATA_PART="/dev/sdc86"
+          NVDATA_PART="/dev/sdc13"
+
+          # kali-archive-keyring 必须在 bootstrap 阶段一起装：
+          # Kali 的归档用它签名，而 Ubuntu 的容器里没有这把钥匙串。
+          # 装上之后 /usr/share/keyrings/kali-archive-keyring.gpg 就是
+          # apt 默认信任目录里的钥匙，sources.list 不需要 signed-by。
+          PACKAGES_CORE="kali-archive-keyring systemd systemd-sysv \
+                         systemd-resolved systemd-timesyncd openssh-server sudo kmod"
+
+          # 只做 CLI 可用性：**刻意不装任何 kali-linux-* 元包**，
+          # 所以这一档镜像很小（约 200 MB 级），最容易先确认能开机、能联网。
+          # 想要工具集/桌面见文件末尾的说明。
+          #
+          # wpasupplicant 必须有 —— 缺了它 NetworkManager 完全没有无线能力，
+          # wlan0 会永远是 unavailable。
+          PACKAGES_EXTRA="network-manager bluez modemmanager iio-sensor-proxy \
+                          alsa-ucm-conf alsa-utils usbutils pciutils iproute2 \
+                          ethtool iw rfkill wireless-regdb wpasupplicant \
+                          kali-defaults \
+                          less nano zstd e2fsprogs dosfstools \
+                          curl wget htop tmux ca-certificates apt-utils"
+
+          # 厂商固件必须提供的文件（自带 blob，用 --firmware 安装，不在此分发）。
+          FIRMWARE_HINTS="mediatek/mt6895/WIFI mediatek/mt6895/*.bin mali_csffw.bin"
+          CONF_EOF
+          # heredoc 里为对齐 YAML 而带的前导空格必须去掉，否则 profile 里
+          # 的续行反斜杠与变量赋值都会被缩进破坏。
+          sed -i 's/^          //' devices/rubens-kali.conf
+
+          # 去掉 heredoc 前导空格后，profile 必须能被 bash 直接 source ——
+          # 这是唯一可靠的检查。不能用「不许有行首空格」来判断：
+          # PACKAGES_EXTRA 的续行是**故意缩进**的，正是那个缩进让反斜杠续行成立。
+          bash -c '. devices/rubens-kali.conf' \
+            || { echo "::error::profile 无法被 bash source"; exit 1; }
+
+          # 取值核对：这些变量缺一个，构建就会走错分支或产出会孤儿化模块的镜像
+          bash -c '
+            set -e
+            . devices/rubens-kali.conf
+            for v in DISTRO SUITE KERNEL_CONFIGS DTS KERNEL_MAKE_ARGS \
+                     ROOTFS_LABEL DEFAULT_USER USERDATA_PART NVDATA_PART \
+                     PACKAGES_CORE PACKAGES_EXTRA; do
+              [ -n "${!v}" ] || { echo "::error::$v 为空"; exit 1; }
+            done
+            [ "$DISTRO" = "kali" ] || { echo "::error::DISTRO=$DISTRO"; exit 1; }
+            [ "$SUITE" = "kali-rolling" ] || { echo "::error::SUITE=$SUITE"; exit 1; }
+            [ -z "$KERNEL_LOCALVERSION" ] \
+              || { echo "::error::KERNEL_LOCALVERSION 必须为空，否则 uname -r 带 + 会孤儿化全部模块"; exit 1; }
+            echo "$PACKAGES_CORE" | grep -qw kali-archive-keyring \
+              || { echo "::error::PACKAGES_CORE 缺 kali-archive-keyring（apt 无法验证 Kali 归档）"; exit 1; }
+            echo "$PACKAGES_EXTRA" | grep -qw wpasupplicant \
+              || { echo "::error::PACKAGES_EXTRA 缺 wpasupplicant（NM 会没有无线能力）"; exit 1; }
+            echo "$PACKAGES_EXTRA" | grep -qw wireless-regdb \
+              || { echo "::error::PACKAGES_EXTRA 缺 wireless-regdb"; exit 1; }
+            echo "profile 变量核对通过；PACKAGES_EXTRA 共 $(echo $PACKAGES_EXTRA | wc -w) 个包"
+          '
+
+          # ── 可选：Kali 工具集 ──
+          # kali-linux-headless 会拉进 nmap / metasploit / hashcat 等几百个工具，
+          # 镜像从约 200 MB 涨到约 3-5 GB，rootfs 的 mkfs.ext4 与 gzip 会明显变慢。
+          #
+          # 两个可选开关的 sed **互相独立**：各自锚定在 "ca-certificates apt-utils"
+          # 这个固定前缀上、把包插在 apt-utils 之后，而不是锚定列表结尾的
+          # `apt-utils"` —— 后者在前一个开关已经改过行尾之后就不再匹配，
+          # 于是"两个开关同时打开"会失败（实测踩到过）。
+          if [ "${{ inputs.build_kali_tools }}" = "true" ]; then
+            sed -i 's/ca-certificates apt-utils/ca-certificates apt-utils kali-linux-headless/' \
+              devices/rubens-kali.conf
+            bash -c '
+              . devices/rubens-kali.conf
+              echo "$PACKAGES_EXTRA" | grep -qw kali-linux-headless \
+                || { echo "::error::工具集包未加入"; exit 1; }
+            '
+            echo "已加入 kali-linux-headless"
+          fi
+
+          # ── 可选：XFCE 桌面 ──
+          # 用 kali-desktop-xfce 而不是整个 kali-linux-default：后者会把
+          # 工具集和桌面一起拉进来（约 8-12 GB），在 180 分钟的 job 预算里
+          # 风险太大。两档都需要时把两个开关都打开即可。
+          if [ "${{ inputs.build_desktop }}" = "true" ]; then
+            sed -i 's/ca-certificates apt-utils/ca-certificates apt-utils kali-desktop-xfce/' \
+              devices/rubens-kali.conf
+            bash -c '
+              . devices/rubens-kali.conf
+              echo "$PACKAGES_EXTRA" | grep -qw kali-desktop-xfce \
+                || { echo "::error::桌面包未加入"; exit 1; }
+            '
+            echo "已加入 kali-desktop-xfce"
+          fi
+
+          echo "--- 生成的 profile ---"
+          cat devices/rubens-kali.conf
+
+      # 上游 distros/ 只有 debian.sh。Kali 不是 Debian 的 suite ——
+      # 它有自己的归档、自己的签名钥匙、以及**没有 -updates/-security
+      # 这两个 pocket**（rolling 自身即持续更新）。所以必须有独立后端。
+      #
+      # build.sh 的调用约定（与 debian.sh 相同）：
+      #   distro_bootstrap <rootfs> <suite> <arch> <mirror> <jobs>
+      #   distro_configure <rootfs> <suite>
+      - name: 写入 Kali 发行版后端
+        run: |
+          set -euxo pipefail
+          cd rootfs-builder
+          mkdir -p distros
+          cat > distros/kali.sh <<'KALI_SH_EOF'
+          #!/usr/bin/env bash
+          # Kali backend for build.sh
+          #
+          # build.sh 调用约定：
+          #   distro_bootstrap <rootfs> <suite> <arch> <mirror> <jobs>
+          #   distro_configure <rootfs> <suite>
+          #
+          # 与 distros/debian.sh 的实质差异（三条，都会让构建失败，不是风格问题）：
+          #
+          # 1. arm64 在**主归档**上。Kali 的归档同时收录 i386/amd64/armhf/arm64
+          #    （已核对 kali-rolling/Release 的 Architectures 字段），
+          #    所以没有 Ubuntu ports 那套 "换一个 host" 的规则。
+          #
+          # 2. **没有 -updates / -security**。Debian 与 Ubuntu 的
+          #    "$suite-updates" / "$suite-security" 在 Kali 上不存在，
+          #    照抄会让 apt update 直接 404。rolling 只有一个 InRelease。
+          #
+          # 3. 签名钥匙是 kali-archive-keyring，Debian/Ubuntu 的钥匙串验不了它。
+          #    该包在 Kali 归档里就有，所以由 PACKAGES_CORE 在 bootstrap 阶段
+          #    装进目标系统 —— 于是 /usr/share/keyrings/kali-archive-keyring.gpg
+          #    落在 apt **默认信任**的目录里，sources.list 不需要 signed-by。
+          #    这与 Kali 官方 build-rootfs.sh 的做法一致。
+          #
+          # bootstrap 阶段还需要一把钥匙让 mmdebstrap 能验证 InRelease：
+          # 由 workflow 从官方 pool 取 kali-archive-keyring 解出钥匙串，
+          # 通过 --keyring 传入（mmdebstrap 的 --keyring 只在它自己跑 apt 时
+          # 生效，不会永久写进 chroot，正好符合这里的需要）。
+
+          KALI_COMPONENTS="${KALI_COMPONENTS:-main,contrib,non-free,non-free-firmware}"
+          KALI_MIRROR="${KALI_MIRROR:-https://http.kali.org/kali}"
+
+          distro_bootstrap() {
+          	local rootfs="$1" suite="$2" arch="$3" mirror="$4" jobs="$5"
+          	local components="$KALI_COMPONENTS"
+          	local pkgs
+          	pkgs="$(printf '%s %s' "${PACKAGES_CORE:-}" "${PACKAGES_EXTRA:-}" \
+          		| tr -s ' ' | sed 's/^ //; s/ $//')"
+
+          	# workflow 没给镜像时用默认值（本地直接调 build.sh 也走得通）
+          	[ -n "$mirror" ] || mirror="$KALI_MIRROR"
+
+          	if ! [ -e /proc/sys/fs/binfmt_misc/qemu-aarch64 ]; then
+          		echo "warning: qemu-aarch64 binfmt handler not registered;" \
+          		     "install qemu-user-static + binfmt-support" >&2
+          	fi
+
+          	# 钥匙串由 workflow 通过环境变量传入（--keyring 要求文件存在）。
+          	#
+          	# CI 里它**必须**在：sudo 默认 env_reset 会丢掉环境变量，所以
+          	# workflow 用的是 `sudo --preserve-env=KALI_KEYRING`。若这里看不到它，
+          	# 说明那一步没生效 —— 直接停，不要退化成"去宿主 /usr/share/keyrings
+          	# 碰运气"：容器里没有 Kali 的钥匙串，那样只会得到一句难懂的
+          	# "no keyring found / NO_PUBKEY"，让人误以为是归档坏了。
+          	local keyring_args=()
+          	if [ -n "${KALI_KEYRING:-}" ] && [ -s "${KALI_KEYRING}" ]; then
+          		echo "kali keyring: $KALI_KEYRING"
+          		keyring_args=(--keyring="$KALI_KEYRING")
+          	elif [ -e /usr/share/keyrings/kali-archive-keyring.gpg ]; then
+          		# 本地直接跑 build.sh 时的合法路径（宿主自己装了 kali-archive-keyring）
+          		echo "kali keyring: /usr/share/keyrings/kali-archive-keyring.gpg (host)"
+          	else
+          		echo "error: 找不到 kali-archive-keyring.gpg" >&2
+          		echo "  KALI_KEYRING='${KALI_KEYRING:-<未设置>}'" >&2
+          		echo "  CI 里请用: sudo --preserve-env=KALI_KEYRING ./build.sh ..." >&2
+          		echo "  本地请安装 kali-archive-keyring 并放到 /usr/share/keyrings/" >&2
+          		return 1
+          	fi
+
+          	# mmdebstrap 把镜像当**位置参数**，不是选项：
+          	#     mmdebstrap [OPTION...] SUITE TARGET [MIRROR...]
+          	# 传 --mirror=$url 会以 "Unknown option: mirror" 中止。
+          	echo "kali: $suite/$arch from $mirror (components: $components)"
+          	mmdebstrap \
+          		--architectures="$arch" \
+          		--variant=important \
+          		--components="$components" \
+          		--include="$pkgs" \
+          		${keyring_args[@]+"${keyring_args[@]}"} \
+          		--aptopt='Apt::Install-Recommends "false"' \
+          		--aptopt='Acquire::Retries "3"' \
+          		--aptopt='Acquire::Check-Valid-Until "false"' \
+          		--dpkgopt='path-exclude=/usr/share/doc/*' \
+          		--dpkgopt='path-exclude=/usr/share/man/*' \
+          		--dpkgopt='path-exclude=/usr/share/locale/*' \
+          		"$suite" "$rootfs" "$mirror"
+
+          	# 这些设备上必须有真正的 init 系统
+          	if ! [ -e "$rootfs/usr/lib/systemd/systemd" ]; then
+          		echo "error: systemd missing in the bootstrapped rootfs" >&2
+          		return 1
+          	fi
+          	# boot.img 里的 initramfs 会执行 switch_root <fs> /sbin/init
+          	if ! [ -e "$rootfs/sbin/init" ]; then
+          		echo "warning: /sbin/init missing; linking it to systemd" >&2
+          		mkdir -p "$rootfs/sbin"
+          		ln -sf /lib/systemd/systemd "$rootfs/sbin/init" 2>/dev/null || true
+          	fi
+          }
+
+          distro_configure() {
+          	local rootfs="$1" suite="$2"
+          	local user="${DEFAULT_USER:-kali}"
+          	local mirror="${MIRROR:-$KALI_MIRROR}"
+          	local arch="${ARCH:-arm64}"
+
+          	# ---------------------------------------------------------- 钥匙自检
+          	# PACKAGES_CORE 里的 kali-archive-keyring 必须在 bootstrap 阶段就装好：
+          	# 下面 sources.list 的 Signed-By 指向它，缺了它 apt 自己会报
+          	# "Missing key / NO_PUBKEY"，那个报错看起来像归档坏了，容易误判。
+          	# 这里提前用一句可操作的报错拦住。
+          	local kr="$rootfs/usr/share/keyrings/kali-archive-keyring.gpg"
+          	if [ ! -s "$kr" ]; then
+          		echo "error: $kr 不存在或为空 —— Kali 归档将无法验签" >&2
+          		echo "  根因通常是：KALI_KEYRING 没传进来（sudo 的 env_reset 会丢变量），" >&2
+          		echo "  导致 bootstrap 阶段连 InRelease 都验不过，kali-archive-keyring 没装上。" >&2
+          		echo "  检查 workflow 是否用了: sudo --preserve-env=KALI_KEYRING ./build.sh ..." >&2
+          		echo "  以及 profile 的 PACKAGES_CORE 是否含 kali-archive-keyring" >&2
+          		return 1
+          	fi
+          	echo "kali keyring installed: $(stat -c %s "$kr") bytes"
+
+          	# ---------------------------------------------------------- sources
+          	# 必须最先做：mmdebstrap 留下的是它自己那行临时 sources.list。
+          	#
+          	# 用 deb822 格式写，与 Kali 自己的镜像构建脚本一致
+          	# （build-rootfs.sh 里那句 `apt modernize-sources -y` 就是把
+          	# one-line 转成这个）。apt 3.x 原生支持，不再需要 Signed-By：
+          	# 钥匙串装在 /usr/share/keyrings/ 这个默认信任目录里。
+          	#
+          	# 只有一个 suite、一个归档，**没有 -updates/-security**。
+          	mkdir -p "$rootfs/etc/apt/sources.list.d"
+          	rm -f "$rootfs/etc/apt/sources.list"
+          	cat > "$rootfs/etc/apt/sources.list.d/kali.sources" <<EOF
+          # MT6895-Mainline rootfs (Kali $suite/$arch)
+          # 由 distros/kali.sh 生成。rolling 是持续更新的，没有 -updates/-security。
+          Types: deb
+          URIs: $mirror
+          Suites: $suite
+          Components: main contrib non-free non-free-firmware
+          Signed-By: /usr/share/keyrings/kali-archive-keyring.gpg
+          EOF
+
+          	# ---------------------------------------------------------- apt setup
+          	if [ -e "$rootfs/etc/resolv.conf" ] || [ -L "$rootfs/etc/resolv.conf" ]; then
+          		:
+          	else
+          		printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' > "$rootfs/etc/resolv.conf"
+          	fi
+
+          	# ---------------------------------------------------------- locale/tz
+          	chroot "$rootfs" /bin/sh -c '
+          		set -e
+          		if [ -x /usr/sbin/locale-gen ]; then
+          			echo "en_US.UTF-8 UTF-8" > /etc/locale.gen
+          			echo "zh_CN.UTF-8 UTF-8" >> /etc/locale.gen
+          			locale-gen >/dev/null 2>&1 || true
+          		fi
+          		ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
+          		echo Asia/Shanghai > /etc/timezone
+          	' || true
+
+          	# ---------------------------------------------------------- extra pkgs
+          	# 逐个安装设备支持包：某个包在 Kali 里不存在时，不至于让整个
+          	# bootstrap 失败，每一次缺失都会被报告。
+          	local pkgs
+          	pkgs="$(printf '%s %s' "${PACKAGES_EXTRA:-}" | tr -s ' ' | sed 's/^ //; s/ $//')"
+          	if [ -n "$pkgs" ]; then
+          		chroot "$rootfs" /bin/sh -c 'apt-get update -qq' || \
+          			echo "warning: apt-get update failed" >&2
+          		for p in $pkgs; do
+          			if chroot "$rootfs" /bin/sh -c \
+          				"DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends $p" \
+          				>/dev/null 2>&1; then
+          				echo "  installed: $p"
+          			else
+          				echo "  SKIPPED (not installable in $suite): $p" >&2
+          			fi
+          		done
+          	fi
+
+          	# ---------------------------------------------------------- default user
+          	# Kali 的 base 系统不自带普通用户（与 Ubuntu base 不同），
+          	# 所以这里必须真的建一个。组列表按**实际存在**过滤：
+          	# 精简的 Kali 里没有 plugdev 之类的组，写死会让 useradd 整个失败。
+          	if ! chroot "$rootfs" /bin/sh -c "id $user" >/dev/null 2>&1; then
+          		local groups="" g
+          		for g in sudo audio video render plugdev netdev dialout bluetooth; do
+          			if chroot "$rootfs" /bin/sh -c "getent group $g" >/dev/null 2>&1; then
+          				groups="${groups:+$groups,}$g"
+          			fi
+          		done
+          		echo "creating user '$user' with groups: ${groups:-<none>}"
+          		chroot "$rootfs" /bin/sh -c "
+          			set -e
+          			useradd -m -s /bin/bash ${groups:+-G $groups} $user
+          			passwd -d $user
+          		" || echo "warning: could not create user $user" >&2
+          	fi
+
+          	# ---------------------------------------------------------- services
+          	for unit in systemd-networkd systemd-resolved systemd-timesyncd \
+          		    ssh NetworkManager bluetooth ModemManager iio-sensor-proxy; do
+          		chroot "$rootfs" systemctl enable "$unit" >/dev/null 2>&1 || true
+          	done
+
+          	# MT6895-Mainline：首次启动把根文件系统扩展到整个分区
+          	chroot "$rootfs" systemctl enable mt6895-firstboot.service >/dev/null 2>&1 || true
+
+          	# ---------------------------------------------------------- ssh
+          	# Kali 与 Debian 一样默认 PermitRootLogin prohibit-password，
+          	# 而 build.sh 只会给 root 设密码（--root-password）。本移植的
+          	# kernel cmdline/initramfs 在设备上没有控制台可交互，SSH 是唯一
+          	# 的进入方式，所以显式放开密码登录。
+          	#
+          	# ⚠️ root 口令来自 --root-password（默认 root），公网可达时必须改。
+          	mkdir -p "$rootfs/etc/ssh/sshd_config.d"
+          	cat > "$rootfs/etc/ssh/sshd_config.d/10-mt6895.conf" <<'EOF'
+          # 由 distros/kali.sh 写入：允许用密码以 root 登录（设备上没有控制台）。
+          PermitRootLogin yes
+          PasswordAuthentication yes
+          EOF
+
+          	# ---------------------------------------------------------- wifi db
+          	# 确保 initramfs 里的 regulatory.db 副本有来源。
+          	if [ ! -e "$rootfs/lib/firmware/regulatory.db" ] && \
+          	   [ -e "$rootfs/usr/lib/firmware/regulatory.db" ]; then
+          		mkdir -p "$rootfs/lib/firmware"
+          		cp -a "$rootfs/usr/lib/firmware/regulatory.db" \
+          		      "$rootfs/usr/lib/firmware/regulatory.db.p7s" \
+          		      "$rootfs/lib/firmware/" 2>/dev/null || true
+          	fi
+
+          	# ---------------------------------------------------------- apt hygiene
+          	rm -rf "$rootfs/var/lib/apt/lists"/* "$rootfs/var/cache/apt"/* 2>/dev/null || true
+          }
+          KALI_SH_EOF
+          sed -i 's/^          //' distros/kali.sh
+          chmod 0755 distros/kali.sh
+          bash -n distros/kali.sh
+          echo "kali.sh 语法 OK（$(wc -l < distros/kali.sh) 行）"
+          # 后端必须真的定义了这两个函数，否则 build.sh 会在 source 之后
+          # 才以 "command not found" 失败 —— 那时内核已经编完了。
+          bash -c '
+            set -e
+            . distros/kali.sh
+            for f in distro_bootstrap distro_configure; do
+              type -t "$f" >/dev/null || { echo "::error::$f 未定义"; exit 1; }
+            done
+            echo "distro_bootstrap / distro_configure 均已定义"
+          '
+
+      # 上游 build.sh 有一个必须修的问题（否则内核根本编不出来），
+      # 与 build.yml 用的是同一个补丁：
+      #
+      #   1. `make vmlinux` 之前没先 `make dtbs`。CONFIG_XIAOMI_RUBENS=y 让
+      #      arch/arm64/kernel/Makefile 依赖板级 DTB（要 objcopy 成
+      #      rubens-dtb.o，setup.c 再把它装成 initial_boot_params 覆盖 LK 的
+      #      FDT）。而生成该 DTB 的规则忘了传 O=$(objtree)，子 make 会跑回
+      #      源码树、找不到 .config 而死在：
+      #          *** Configuration file ".config" not found!
+      #      由于规则标了 FORCE，它每次构建都触发，所以失败总是落在 vmlinux 上。
+      #
+      #   2. 每次运行都 rm -rf 工作目录并完整重编内核 + 约 1600 个模块
+      #      （10-15 分钟），而这与 userspace 步骤完全无关。补丁加入
+      #      $OUT/kernel-cache 快速路径，让已有产物可直接复用。
+      #
+      # ── 关于这个补丁的脆弱性 ──
+      # 补丁用行号上下文定位，上游改了 build.sh 就可能对不上。已实测：
+      # 对 2026-09 的 main（build.sh 454 行）仍能干净应用。
+      # 若哪天失败，`patch --forward` 会报 "previously applied" 或 hunk 失败，
+      # 那时不要去调上下文行号 —— 先看 build.sh 是否已经把这两点修好了，
+      # 修好了就整段删掉这一步。
+      - name: 修补 build.sh（dtbs 顺序 + 内核缓存）
+        run: |
+          set -euxo pipefail
+          cd rootfs-builder
+          cat > /tmp/0002-kernel-cache.patch <<'PATCH_EOF'
+          # ── 补丁正文不在这里手抄 ──
+          # 下面这段 heredoc 的内容会由紧接着的 sed 从 **build.yml** 里按行取出，
+          # 而不是在本文件里再维护一份副本。
+          #
+          # 为什么：这个补丁曾经在本文件里手抄过一份，结果上下文行少了一个前导
+          # 空格（patch 的上下文行必须带 1 个空格，而 YAML 块标量会把 10 个缩进
+          # 空格去掉，所以源文件里得写 11 个）。那个副本在 CI 上会让 3 个 hunk
+          # 全部失败，而且只在真正跑起来时才暴露。
+          # 让两处共用一份定义，就没有"改了一边忘了另一边"的可能了。
+          PATCH_EOF
+
+          # 从 build.yml 里取出补丁正文：
+          #   1022..1159 是 heredoc 的内容行（1021 是 `cat ... <<'PATCH_EOF'`，
+          #   1160 是终止行 `PATCH_EOF`）
+          # 再删掉为对齐 YAML 加上的 10 个前导空格。
+          # 只删精确的 10 空格前缀，因此补丁里新增行的 TAB 缩进保持原样，
+          # 空行也保持为空。
+          #
+          # ⚠️ 一旦改动 build.yml 里那个 heredoc 的位置，就要同步改这里的两行。
+          # 下面有断言：取出来的东西必须以 `diff --git` 开头、行数合理，
+          # 否则立刻失败，而不是把一份残缺的补丁喂给 patch(1)。
+          #
+          # 路径必须用 $GITHUB_WORKSPACE：rootfs-builder 是**独立克隆**，
+          # 此刻 cd 在里面，`../.github` 指的是那个克隆内部的目录，不是本仓库。
+          sed -n '1022,1159p' "$GITHUB_WORKSPACE/.github/workflows/build.yml" \
+            | sed 's/^          //' >> /tmp/0002-kernel-cache.patch
+
+          grep -q '^diff --git a/build\.sh b/build\.sh$' /tmp/0002-kernel-cache.patch \
+            || { echo "::error::没能从 build.yml 取出补丁正文（首行不是 diff --git）"; \
+                 echo "build.yml 的 PATCH_EOF 位置可能变了，见本步骤的注释"; \
+                 head -5 /tmp/0002-kernel-cache.patch; exit 1; }
+          # 尾行也要对：patch 的最后一行正是 build.sh 里那句 distro_configure
+          # （其后还有一个作为上下文空行的尾随空格）。首尾都对得上，
+          # 才能确定取到的是一份**完整**的补丁而不是被截断的片段。
+          grep -qF ' distro_configure "$ROOTFS" "$SUITE"' /tmp/0002-kernel-cache.patch \
+            || { echo "::error::补丁正文末尾不对，可能被截断"; tail -5 /tmp/0002-kernel-cache.patch; exit 1; }
+          PATCHLINES=$(wc -l < /tmp/0002-kernel-cache.patch)
+          echo "从 build.yml 取出补丁正文：$PATCHLINES 行（首尾已核对）"
+          # 首尾两个 grep 已经足以判定完整性，这里只再兜一道底：
+          # 147 行是当前值，明显少于它说明抽取范围被改坏了。
+          [ "$PATCHLINES" -ge 140 ] \
+            || { echo "::error::补丁只有 $PATCHLINES 行（预期 147），抽取范围可能不对"; exit 1; }
+
+          patch -p1 --forward < /tmp/0002-kernel-cache.patch
+          bash -n build.sh
+          echo "build.sh 语法 OK"
+          grep -n 'dtbs FIRST\|kernel cache\|export MIRROR ARCH' build.sh
+
+          # 打完之后必须真的有那三处改动，否则后面会以更难懂的方式失败：
+          # build.sh 不认 $OUT/kernel-cache，就会把内核从头再编一遍（多花 10-15 分钟），
+          # 而 kali.sh 的镜像变量也可能与 bootstrap 用的不是同一个。
+          grep -q 'KERNEL_CACHE=' build.sh || { echo "::error::build.sh 没有 kernel-cache 快路径"; exit 1; }
+          grep -q 'dtbs FIRST' build.sh    || { echo "::error::build.sh 没有 dtbs 顺序修复"; exit 1; }
+          grep -q 'export MIRROR ARCH' build.sh || { echo "::error::build.sh 没有导出 MIRROR/ARCH"; exit 1; }
+          echo "✅ 补丁三处改动均已生效"
+
+      # ────────────────────────────────────────────── 6. 构建 rootfs
+      #
+      # build.sh 会命中上面做好的内核缓存（打印 "reusing the cached kernel build"
+      # 与 "kernel image: SKIPPED"），所以这里**不重编内核**，只剩 userspace 工作。
+      # --kernel-repo 指向 kernel/（**一定是带 .git 的全新克隆**），因为缓存命中时
+      # build.sh 要跑 `git -C "$KERNEL_REPO" archive` 把源码铺回 $KBOUT；
+      # 而 --kernel-config 取 $KERNEL_DIR 的，保证与模块同源。
+      #
+      # --mirror 显式传给 Kali 归档：distro_configure 要写进 sources.list 的
+      # 必须是**和 bootstrap 同一个**归档，否则装包时会打成 404 或验签失败。
+      # `mirror` 输入留空时用 env 里的 TUNA 默认值。
+      #
+      # ── 为什么是 `sudo --preserve-env=KALI_KEYRING` ──
+      # build.sh 必须以 root 跑，而 sudoers 默认 env_reset：它会把环境重置成
+      # 一小份白名单，KALI_KEYRING 这种自定义变量会被**静默**丢掉。丢掉之后
+      # mmdebstrap 就没有可信钥匙去验证 Kali 的 InRelease，构建立刻失败，而且
+      # 报错看起来像"归档签名有问题"，很难联想到是 sudo 吞了变量。
+      # 所以这里显式保留它；kali.sh 那边也会在变量缺失时直接给出可操作的报错。
+      - name: 构建 rootfs（缓存命中时不重编内核）
+        run: |
+          set -euxo pipefail
+          cd rootfs-builder
+          KALI_MIRROR_IN="${{ inputs.mirror }}"
+          [ -n "$KALI_MIRROR_IN" ] || KALI_MIRROR_IN="$KALI_MIRROR"
+          echo "Kali 归档  : $KALI_MIRROR_IN"
+          echo "Kali 钥匙串: $KALI_KEYRING"
+          [ -s "$KALI_KEYRING" ] || { echo "::error::KALI_KEYRING 为空或文件不存在: '$KALI_KEYRING'"; exit 1; }
+
+          sudo --preserve-env=KALI_KEYRING ./build.sh \
+            --device        rubens-kali \
+            --distro        kali \
+            --suite         "$KALI_SUITE" \
+            --mirror        "$KALI_MIRROR_IN" \
+            --kernel-repo   "$PWD/../kernel" \
+            --kernel-config "$PWD/../$KERNEL_DIR/.config" \
+            --firmware      "$PWD/../firmware" \
+            --jobs          "$(nproc)" \
+            --hostname      kali \
+            --root-password root
+
+      - name: 校验 rootfs
+        run: |
+          set -euxo pipefail
+          cd rootfs-builder
+          IMG=$(ls -t out/rootfs-rubens-kali-rolling-*-sparse.img | head -1)
+          echo "镜像: $IMG ($(stat -c %s "$IMG") 字节)"
+          # 写进 GITHUB_ENV 的必须是**绝对路径**：后面「生成校验和」在仓库根目录跑，
+          # 而这里的 $IMG 是相对 rootfs-builder/ 的。
+          echo "IMG=${GITHUB_WORKSPACE}/rootfs-builder/${IMG}" >> "$GITHUB_ENV"
+          simg2img "$IMG" /tmp/rootfs.raw
+
+          LABEL=$(dd if=/tmp/rootfs.raw bs=1 skip=$((1024+120)) count=16 2>/dev/null | tr -d '\0')
+          [ "$LABEL" = "mt6895rubens" ] || { echo "::error::卷标是 '$LABEL'，应为 mt6895rubens"; exit 1; }
+          echo "卷标: $LABEL"
+
+          rm -rf /tmp/mods && mkdir -p /tmp/mods
+          debugfs -R "rdump /lib/modules/$REL/kernel /tmp/mods" /tmp/rootfs.raw >/dev/null 2>&1
+          N=$(find /tmp/mods -name '*.ko' | wc -l)
+          echo "模块数: $N"
+          [ "$N" -gt 1000 ] || { echo "::error::模块数异常 ($N)"; exit 1; }
+
+          # 这些路径是「Kali 真的装进去了」的判据。nmcli 在最小安装里
+          # **不存在**（只有装上 network-manager 才有），所以不在这里查它。
+          for p in /sbin/init /lib/systemd/systemd /usr/bin/apt \
+                   /usr/share/keyrings/kali-archive-keyring.gpg \
+                   /etc/apt/sources.list.d/kali.sources \
+                   /etc/ssh/sshd_config.d/10-mt6895.conf \
+                   /lib/firmware/arm/mali/arch10.8/mali_csffw.bin \
+                   /lib/firmware/conninfra.cfg; do
+            debugfs -R "stat $p" /tmp/rootfs.raw 2>/dev/null | grep -q '^ *Inode:' \
+              || { echo "::error::rootfs 缺少 $p"; exit 1; }
+          done
+
+          # 确认这确实是 Kali 而不是 Debian/Ubuntu
+          debugfs -R "cat /etc/os-release" /tmp/rootfs.raw 2>/dev/null \
+            | tee /tmp/os-release.txt
+          grep -qi '^ID=kali' /tmp/os-release.txt \
+            || { echo "::error::/etc/os-release 里没有 ID=kali，这个 rootfs 不是 Kali"; exit 1; }
+          echo "✅ 确认是 Kali：$(grep '^PRETTY_NAME=' /tmp/os-release.txt)"
+
+          # 默认用户（kali）与它的免密 sudo 规则
+          debugfs -R "stat /home/kali" /tmp/rootfs.raw 2>/dev/null | grep -q '^ *Inode:' \
+            || { echo "::error::rootfs 缺少 /home/kali（DEFAULT_USER 没建出来）"; exit 1; }
+          debugfs -R "stat /etc/sudoers.d/010-kali" /tmp/rootfs.raw 2>/dev/null | grep -q '^ *Inode:' \
+            || { echo "::error::rootfs 缺少 /etc/sudoers.d/010-kali"; exit 1; }
+          echo "rootfs 校验通过（Kali $KALI_SUITE）"
+
+      # ─────────────────────────────────────────────────────────────────
+      # 产物上传（1/2）：内核 + rootfs
+      #
+      # `if: ${{ !cancelled() }}` 是刻意的 —— rootfs 一旦构建出来就是有价值的成果，
+      # 后面任何一步（打 boot.img、算校验和、存缓存…）失败都不该把它丢掉。
+      #
+      # 注意产物名里的 **rubens-kali**（而不是 -ubuntu）：build.sh 用
+      # DEVICE 名命名产物，两个 workflow 的 artifact 因此天然不冲突。
+      # ─────────────────────────────────────────────────────────────────
+      - name: 上传产物（内核 + rootfs，无论后续成败）
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: rubens-kali-rolling-kernel-rootfs-${{ github.run_number }}
+          path: |
+            rootfs-builder/out/Image-rubens-kali
+            rootfs-builder/out/dtb-rubens-kali.dtb
+            rootfs-builder/out/KERNEL-INFO-rubens-kali.txt
+            rootfs-builder/out/rootfs-rubens-kali-rolling-*-sparse.img
+            rootfs-builder/out/rootfs-rubens-kali-rolling-*-sparse.img.gz
+          retention-days: 30
+
+      # ────────────────────────────────────────────── 7. 打包启动镜像
+      - name: 打包 boot.img
+        run: |
+          set -euxo pipefail
+          chmod +x scripts/*.sh
+          ./scripts/make-bootimg.sh \
+            --kernel  "$KERNEL_DIR/arch/arm64/boot/Image" \
+            --ramdisk ramdisk-proven.lz4 \
+            --firmware firmware \
+            --out     boot-kali.img
+
+      # ────────────────────────────────────────────── 8. 产物
+      - name: 生成校验和
+        run: |
+          set -euxo pipefail
+          # 先确认每个要算的文件都在，缺哪个就明确报哪个 —— 否则只会看到
+          # 一行 "sha256sum: <path>: No such file or directory"。
+          MISSING=0
+          for f in "$KERNEL_DIR/arch/arm64/boot/Image" \
+                   "$KERNEL_DIR/arch/arm64/boot/dts/mediatek/mt6895-xiaomi-rubens.dtb" \
+                   boot-kali.img "$IMG"; do
+            if [ -f "$f" ]; then
+              printf '  ✅ %-64s %s 字节\n' "$f" "$(stat -c %s "$f")"
+            else
+              printf '  ❌ %-64s 缺失\n' "$f"
+              MISSING=1
+            fi
+          done
+          [ "$MISSING" = 0 ] || { echo "::error::有产物缺失，无法生成校验和"; exit 1; }
+
+          {
+            echo "# rubens Kali (kali-rolling) 构建产物"
+            echo "# 内核来源: $DEFAULT_KERNEL_REPO"
+            echo "# 分支:     $DEFAULT_KERNEL_BRANCH"
+            echo "# commit:   $DEFAULT_KERNEL_COMMIT"
+            echo "# Kali 归档: ${{ inputs.mirror != '' && inputs.mirror || 'https://mirrors.tuna.tsinghua.edu.cn/kali' }}"
+            echo "# 工作流:   ${{ github.sha }}"
+            echo
+            sha256sum "$KERNEL_DIR/arch/arm64/boot/Image"
+            sha256sum "$KERNEL_DIR/arch/arm64/boot/dts/mediatek/mt6895-xiaomi-rubens.dtb"
+            sha256sum boot-kali.img
+            sha256sum "$IMG"
+          } | tee SHA256SUMS
+
+      - name: 上传产物（boot.img + 校验和，无论后续成败）
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: rubens-kali-rolling-boot-${{ github.run_number }}
+          if-no-files-found: ignore
+          path: |
+            boot-kali.img
+            SHA256SUMS
+          retention-days: 30
+
+      # ────────────────────────────────────────────── 9. 精简内核树（为缓存瘦身）
+      # 实测 modules_install **一个 .o 都不需要**（它只读 modules.order 与 .ko）。
+      # 删掉 .o 后树从 9.9 GB 降到 4.6 GB，压缩后约 1 GB。
+      # .git 必须保留 —— build.sh 要在 KERNEL_REPO 里跑 git archive 铺源码。
+      - name: 精简内核缓存（删 .o）
+        if: env.SKIP_KERNEL_BUILD != '1'
+        run: |
+          set -euxo pipefail
+          BEFORE=$(du -sm kernel-cache | cut -f1)
+          find kernel-cache -name '*.o' -delete
+          find kernel-cache -name '.*.o.cmd' -delete
+          AFTER=$(du -sm kernel-cache | cut -f1)
+          echo "删掉 .o：${BEFORE} MB -> ${AFTER} MB"
+          for f in arch/arm64/boot/Image .config Module.symvers \
+                   include/config/kernel.release modules.order .git; do
+            [ -e "kernel-cache/$f" ] || { echo "::error::缓存内容缺 $f"; exit 1; }
+          done
+          N=$(find kernel-cache -name '*.ko' | wc -l)
+          [ "$N" -gt 1500 ] || { echo "::error::模块数异常: $N"; exit 1; }
+          echo "缓存内容自检通过（$N 个 .ko）"
+
+      # ────────────────────────────────────────────── 10. 保存内核缓存（跨 run 复用）
+      #
+      # key 与「恢复内核缓存」以及 build.yml 完全一致 —— 这就是两个 workflow
+      # 能互相命中、且只占一份缓存的原因。详见「恢复内核缓存」的说明。
+      - name: 保存内核缓存
+        if: env.SKIP_KERNEL_BUILD != '1'
+        uses: actions/cache/save@v4
+        with:
+          path: kernel-cache
+          key: >-
+            kernel-${{ env.CACHE_VERSION }}-${{
+              format('{0}-{1}', env.DEFAULT_KERNEL_COMMIT, hashFiles('configs/kernel.config', 'configs/mt6895-fixups.config', 'patches/0001-rubens-port-fixes.patch'))
+            }}
+
+      - name: 写入构建摘要
+        if: always()
+        # 用 ${KERNEL_DIR:-kernel} 而不是 $KERNEL_DIR：这一步是 always()，
+        # 早期就失败时 KERNEL_DIR 从未被设置，而 run 块默认 `set -u`，
+        # 裸 "$KERNEL_DIR" 会让摘要步骤本身报「未绑定的变量」而失败 ——
+        # 恰恰在最需要摘要的时候没有摘要。
+        run: ./scripts/ci-summary.sh "${KERNEL_DIR:-kernel}" >> "$GITHUB_STEP_SUMMARY"
