@@ -413,8 +413,12 @@ jobs:
           fi
           echo "✅ 指纹匹配：$KALI_KEY_FPR"
 
-          echo "KR=$KR" >> "$GITHUB_ENV"
-          echo "KALI_KEYRING_DEB=$DEB" >> "$GITHUB_ENV"
+          # 变量名必须与「构建 rootfs」那一步读的**完全一致**。
+          # run 2 就是死在这里：这里导出的是 KR，而那一步读 KALI_KEYRING，
+          # 于是脚本以 "KALI_KEYRING: parameter not set" 退出（sh -e 下未定义
+          # 变量直接中止）。两个名字只用其中一个，别再引入别名。
+          echo "KALI_KEYRING=$KR" >> "$GITHUB_ENV"
+          echo "导出 KALI_KEYRING=$KR"
 
       # ────────────────────────────────────────────── 3. 克隆内核
       #
