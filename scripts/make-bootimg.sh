@@ -47,11 +47,36 @@ LZ4=/usr/bin/lz4
 WORK=$(mktemp -d /tmp/mkboot-XXXXXX)
 trap 'rm -rf "$WORK"' EXIT
 
+# 取文件开头 4 字节的十六进制。xxd 属于 vim-common，精简容器里不一定有
+# （CI 的 ubuntu:26.04 就没有，run 12 因此报 "xxd: command not found"）。
+# od 属于 coreutils，任何环境都有，输出等价：
+#   xxd -p -l4 f  ==  od -An -tx1 -N4 f | tr -d ' \n'
+hex4() {
+	if command -v xxd >/dev/null 2>&1; then
+		xxd -p -l4 "$1"
+	else
+		od -An -tx1 -N4 "$1" | tr -d ' \n'
+	fi
+}
+
 ok()   { printf '  \033[32mOK\033[0m   %s\n' "$*"; }
 bad()  { printf '  \033[31mFAIL\033[0m %s\n' "$*"; }
 warn() { printf '  \033[33mWARN\033[0m %s\n' "$*"; }
 info() { printf '       %s\n' "$*"; }
 hdr()  { printf '\n\033[1m%s\033[0m\n' "$*"; }
+
+# 依赖自检：这些工具缺任何一个都会在后面的步骤里以难懂的方式失败
+hdr "0. 依赖自检"
+_dep_fail=0
+for t in "$LZ4" gzip cpio mkbootimg python3 stat mktemp; do
+	if command -v "$t" >/dev/null 2>&1; then
+		info "$t -> $(command -v "$t")"
+	else
+		bad "缺少依赖: $t"
+		_dep_fail=1
+	fi
+done
+[ "$_dep_fail" = 0 ] || { echo; bad "请先安装缺失的工具"; exit 1; }
 
 hdr "1. 输入检查"
 for f in "$KERNEL" "$RAMDISK"; do
@@ -352,7 +377,7 @@ if [ "$RD" -gt 4194304 ]; then
 fi
 ok "ramdisk $RD 字节（预算 4194304，占用 $((RD * 100 / 4194304))%）"
 
-magic=$(xxd -p -l4 "$WORK/new.lz4")
+magic=$(hex4 "$WORK/new.lz4")
 if [ "$magic" = "$LZ4_MAGIC" ]; then
 	ok "LZ4 legacy 格式（魔数 $magic）"
 else
@@ -398,7 +423,7 @@ gzip -dc "$V/kernel" > "$V/k" 2>/dev/null
 if cmp -s "$V/k" "$KERNEL"; then ok "内核逐字节一致"
 else bad "内核不一致"; exit 1; fi
 
-if [ "$(xxd -p -l4 "$V/ramdisk")" = "$LZ4_MAGIC" ]; then
+if [ "$(hex4 "$V/ramdisk")" = "$LZ4_MAGIC" ]; then
 	ok "ramdisk 是 LZ4 legacy"
 else
 	bad "ramdisk 格式错误"; exit 1

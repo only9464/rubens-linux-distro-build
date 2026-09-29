@@ -115,7 +115,7 @@ jobs:
             device-tree-compiler \
             cpio gzip xz-utils zstd lz4 \
             python3 python3-pip \
-            git rsync patch curl wget ca-certificates \
+            git rsync patch curl wget ca-certificates file \
             mmdebstrap \
             kmod e2fsprogs util-linux \
             android-sdk-libsparse-utils \
@@ -238,13 +238,17 @@ jobs:
           [ "$fail" = 0 ] || exit 1
           echo "✅ 工具链满足要求"
 
-          # 打包 boot.img 需要的两个工具
+          # 打包 boot.img 需要的工具。
           #
           # 注意：mkbootimg 在 Ubuntu 26.04 里是 universe 的正式包
           # （source: android-platform-tools），直接用 apt 装即可。
           # 不要用 pip —— 26.04 是 PEP 668 的 externally-managed 环境，
           # pip 会拒绝安装（除非加 --break-system-packages）。
-          for t in mkbootimg simg2img; do
+          #
+          # lz4/cpio/gzip 也要在这里查：make-bootimg.sh 三步都用它们，
+          # 而它只在最后才报错。run 12 就是死在打包阶段缺 xxd（现已改为
+          # 优先 xxd、回退 od，不再依赖 vim-common）。
+          for t in mkbootimg simg2img lz4 cpio gzip; do
             printf '  %-12s %s\n' "$t" "$(command -v $t || echo '❌ 缺失')"
             command -v "$t" >/dev/null 2>&1 || { echo "::error::$t 不可用"; fail=1; }
           done
@@ -1296,4 +1300,8 @@ jobs:
 
       - name: 写入构建摘要
         if: always()
-        run: ./scripts/ci-summary.sh "$KERNEL_DIR" >> "$GITHUB_STEP_SUMMARY"
+        # 用 ${KERNEL_DIR:-kernel} 而不是 $KERNEL_DIR：这一步是 always()，
+        # 早期就失败时 KERNEL_DIR 从未被设置，而 run 块默认 `set -u`，
+        # 裸 "$KERNEL_DIR" 会让摘要步骤本身报「未绑定的变量」而失败 ——
+        # 恰恰在最需要摘要的时候没有摘要。
+        run: ./scripts/ci-summary.sh "${KERNEL_DIR:-kernel}" >> "$GITHUB_STEP_SUMMARY"
