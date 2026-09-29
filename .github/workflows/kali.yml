@@ -142,7 +142,20 @@ jobs:
             kmod e2fsprogs util-linux \
             android-sdk-libsparse-utils \
             mkbootimg \
-            qemu-user qemu-user-binfmt binfmt-support arch-test
+            qemu-user qemu-user-binfmt binfmt-support arch-test \
+            gnupg
+
+      # gnupg 是 Kali 特有的新增项（build.yml 不需要，因为它的 mmdebstrap
+      # 调用不带 --keyring）。两处都要用到它，缺了会在两个不同的地方失败：
+      #
+      #   1. 「准备 Kali 归档钥匙」用 gpg --list-keys 核对指纹 —— 没有 gpg 时
+      #      报的是 "gpg 无法读取钥匙串"，看起来像钥匙串坏了，其实是没装 gpg。
+      #      （run 1 就是死在这里。）
+      #   2. mmdebstrap 自己：它判断"这个 SUITE 的钥匙是否已被 apt 信任"、
+      #      以及给 sources.list 补 signed-by，都依赖 gpg；--keyring 传进去的
+      #      钥匙串同样要靠它读。
+      #
+      # 容器是精简的 ubuntu:26.04，gnupg 不会"顺便"带上。
 
       # 在 x86-64 runner 上构建 arm64 rootfs，必须让内核能执行 arm64 二进制：
       # qemu-user-binfmt 会为 qemu-aarch64 注册 binfmt_misc handler。
@@ -299,6 +312,8 @@ jobs:
           echo "build.sh 会调用但不在 requires 列表里的："
           check img2simg    android-sdk-libsparse-utils
           check llvm-strip  llvm
+          echo "Kali 后端额外需要的："
+          check gpg         gnupg   # 指纹核对 + mmdebstrap --keyring
           [ "$fail" = 0 ] || { echo "::error::容器缺少 rootfs 构建所需的宿主工具"; exit 1; }
           echo "✅ 宿主工具齐备"
 
@@ -360,10 +375,35 @@ jobs:
 
           echo "== 指纹核对 =="
           # 容器里没有 Kali 的钥匙串，这是唯一能验证的来源；核对通过才继续。
-          gpg --no-default-keyring --keyring "$KR" --list-keys --with-colons \
-            > fpr.txt 2>/dev/null || { echo "::error::gpg 无法读取钥匙串"; cat fpr.txt; exit 1; }
+          #
+          # 先确认 gpg 真的在：容器是精简的 ubuntu:26.04，gnupg 不会"顺便"
+          # 带上（工具链那一步显式装了）。缺了它 gpg 会以 127 退出，而那条
+          # 报错信息很容易被误读成"钥匙串坏了"（run 1 就死在这里）。
+          if ! command -v gpg >/dev/null 2>&1; then
+            echo "::error::gpg 不存在 —— 工具链那一步需要安装 gnupg"
+            echo "（mmdebstrap 的 --keyring 同样依赖它）"
+            exit 1
+          fi
+          echo "gpg: $(gpg --version | head -1)"
+
+          # stderr 必须留下来：gpg 的失败原因（unknown packet type、
+          # 权限、版本不支持…）都在 stderr，丢掉它只剩一句无用的报错。
+          if ! gpg --no-default-keyring --keyring "$KR" --list-keys --with-colons \
+                 > fpr.txt 2> gpg.err; then
+            echo "::error::gpg 无法读取钥匙串"
+            echo "--- gpg 的 stderr ---"
+            cat gpg.err
+            echo "--- stdout ---"
+            cat fpr.txt
+            echo "--- 文件本身 ---"
+            file "$KR"; stat -c '%s 字节 %a 权限' "$KR"
+            exit 1
+          fi
           echo "钥匙串里的密钥："
           awk -F: '/^fpr:/{print "  "$10}' fpr.txt
+          NR_KEYS=$(grep -c '^fpr:' fpr.txt || true)
+          echo "共 $NR_KEYS 把密钥"
+          [ "$NR_KEYS" -ge 1 ] || { echo "::error::钥匙串里一把密钥都没有"; exit 1; }
 
           if ! grep -qF "$KALI_KEY_FPR" fpr.txt; then
             echo "::error::钥匙串里没有预期指纹 $KALI_KEY_FPR"
